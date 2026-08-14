@@ -55,6 +55,14 @@ var version = selfupdate.DevVersion
 // misconfiguration into arbitrary code execution.
 const updateRepo = "jroedel/dmarc-monitor"
 
+// scheduleZone is the timezone deploy/crontab.example schedules in. The crontab
+// guard asks the system for the hour in this zone, and if the zone cannot be
+// resolved the shell's date silently answers in UTC instead — which would move
+// every run by two hours in winter and three in summer, without an error
+// anywhere. -check resolves it here so that failure is found at install time by
+// someone who is looking, rather than months later by nobody.
+const scheduleZone = "America/Chicago"
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "dmarc-monitor: %v\n", err)
@@ -420,7 +428,40 @@ func check(ctx context.Context, log interface{ Info(string, ...any) }, cfg confi
 	}
 	fmt.Printf("Nothing below %s will be sent.\n", cfg.AlertFloor)
 
+	reportSchedule()
+
 	return nil
+}
+
+// reportSchedule prints what the scheduled times mean on this machine, and
+// complains if the timezone the crontab guard depends on is not installed.
+func reportSchedule() {
+	now := time.Now()
+
+	loc, err := time.LoadLocation(scheduleZone)
+	if err != nil {
+		fmt.Printf("\nWARNING: this machine cannot resolve %s (%v).\n", scheduleZone, err)
+		fmt.Println("The crontab guard asks for the hour in that zone; without it the shell's")
+		fmt.Println("date falls back to UTC silently and the runs happen at the wrong times.")
+		fmt.Println("Install tzdata:  sudo apt install tzdata")
+
+		return
+	}
+
+	fmt.Printf("\nLocal time here is %s; in %s it is %s.\n",
+		now.Format("15:04 MST"), scheduleZone, now.In(loc).Format("15:04 MST"))
+	fmt.Printf("deploy/crontab.example runs at 08:00 and 20:00 %s, which is %s and %s here today.\n",
+		scheduleZone,
+		nextAt(now, loc, 8).Local().Format("15:04 MST"),
+		nextAt(now, loc, 20).Local().Format("15:04 MST"))
+}
+
+// nextAt returns today's occurrence of an hour in loc, which is all that is
+// needed to show an operator what the schedule means in their own clock.
+func nextAt(now time.Time, loc *time.Location, hour int) time.Time {
+	there := now.In(loc)
+
+	return time.Date(there.Year(), there.Month(), there.Day(), hour, 0, 0, 0, loc)
 }
 
 // report prints the outcome of a single cycle to stdout. The log goes to
