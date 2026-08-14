@@ -14,6 +14,12 @@ BINARY      ?= dmarc-monitor
 CMD         ?= ./cmd/dmarc-monitor
 CREDENTIALS ?= $(HOME)/.local/share/dmarc-monitor/credentials.env
 
+# VERSION is stamped into the binary and is what the self-updater compares
+# against a published release. A working tree with no tag builds as "dev",
+# which the updater treats as older than anything published.
+VERSION     ?= $(shell git describe --tags --exact-match 2>/dev/null || echo dev)
+LDFLAGS     ?= -X main.version=$(VERSION)
+
 .DEFAULT_GOAL := help
 
 .PHONY: help
@@ -27,7 +33,22 @@ deps: ## Download module dependencies into the module cache
 
 .PHONY: build
 build: ## Build the binary
-	$(GO) build -o $(BINARY) $(CMD)
+	$(GO) build -ldflags "$(LDFLAGS)" -o $(BINARY) $(CMD)
+
+.PHONY: version
+version: ## Show the version this tree would build as
+	@echo $(VERSION)
+
+.PHONY: release
+release: ## Tag and push a release; the workflow builds and publishes it (make release V=v0.1.0)
+	@[ -n "$(V)" ] || { echo "usage: make release V=v0.1.0"; exit 1; }
+	@[ -z "$$(git status --porcelain)" ] || { echo "working tree is dirty; commit first"; exit 1; }
+	@echo "$(V)" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$$' || { echo "version must look like v0.1.0"; exit 1; }
+	git tag -a "$(V)" -m "$(V)"
+	git push origin "$(V)"
+	@echo
+	@echo "Pushed $(V). Watch the build:  gh run watch"
+	@echo "Servers pick it up at their next scheduled run."
 
 .PHONY: init-credentials
 init-credentials: ## Write a commented credentials template to ~/.local/share/dmarc-monitor
@@ -36,6 +57,10 @@ init-credentials: ## Write a commented credentials template to ~/.local/share/dm
 .PHONY: run
 run: ## Run one polling cycle, printing the alert instead of sending it
 	$(GO) run $(CMD) -once -dry-run
+
+.PHONY: crontab
+crontab: ## Print the crontab entry that installs and runs this on a server
+	@sed -e "s|__REPO__|jroedel/dmarc-monitor|g" deploy/crontab.example
 
 .PHONY: check
 check: ## Verify credentials parse and both endpoints are reachable (connects!)

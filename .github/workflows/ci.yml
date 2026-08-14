@@ -1,0 +1,39 @@
+# The same gate `make test` runs locally.
+#
+# Worth more here than in most repositories: servers install published releases
+# without anyone watching, so the tag that triggers a release should only ever
+# be cut on a commit this has already passed.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Lint
+        run: |
+          go vet ./...
+          test -z "$(gofmt -l .)" || { echo "gofmt needed:"; gofmt -l .; exit 1; }
+
+      - name: Test
+        run: go test -race ./...
+
+      # Fails the build on a known-vulnerable dependency or toolchain, which is
+      # how the go.mod patch pin stays honest.
+      - name: Vulnerabilities
+        run: go tool govulncheck ./...

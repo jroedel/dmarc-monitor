@@ -63,50 +63,79 @@ Six values have no default and must be filled in: `IMAP_USERNAME`,
 `ALERT_FROM` must be an address the relay will send as. If it fails your own SPF
 or DKIM, the alert about DMARC gets quarantined.
 
-## Running it unattended
+## Deploying it
 
-`-watch` polls on `POLL_INTERVAL` (default 6h). A systemd timer running `-once`
-is the better arrangement — it survives reboots and leaves the logging to the
-journal.
-
-```ini
-# ~/.config/systemd/user/dmarc-monitor.service
-[Unit]
-Description=Check DMARC aggregate reports
-
-[Service]
-Type=oneshot
-ExecStart=%h/bin/dmarc-monitor -once -log json
-```
-
-```ini
-# ~/.config/systemd/user/dmarc-monitor.timer
-[Unit]
-Description=Check DMARC aggregate reports twice a day
-
-[Timer]
-OnCalendar=06,18:00
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-```
-
-With cron instead:
+The whole deployment is one crontab entry. It downloads the binary if it is
+missing; the binary keeps itself current from then on. `deploy/crontab.example`
+is the annotated version — `make crontab` prints it — and this is the line:
 
 ```cron
-# m  h        dom mon dow
-  17 6,18     *   *   *    /home/you/bin/dmarc-monitor -once -log json >> /home/you/.local/state/dmarc-monitor/cron.log 2>&1
+CRON_TZ=America/Chicago
+MAILTO=you@example.com
+
+0 7,19 * * * D="$HOME/.local/bin"; L="$HOME/.local/state/dmarc-monitor"; B="$D/dmarc-monitor"; mkdir -p "$D" "$L"; [ -x "$B" ] || { curl -fsSL "https://github.com/jroedel/dmarc-monitor/releases/latest/download/dmarc-monitor-linux-amd64" -o "$B" && chmod +x "$B"; }; "$B" -cron >> "$L/cron.log" 2>&1 || echo "dmarc-monitor failed; see $L/cron.log"
 ```
 
-Two things bite here. Give the binary an absolute path — cron's `PATH` is
-nearly empty. And leave `HOME` alone: the credentials and state files are found
-relative to it, so a crontab that unsets or overrides `HOME` will send the
-program looking for its credentials somewhere they are not. `MAILTO=` is worth
-setting if you would rather see failures as mail than in the log.
+Twice a day, Central time, following daylight saving. Reports arrive once a
+day, so this catches one within twelve hours; a run takes about a second.
 
-Reporters send once a day. Polling faster than a few hours only annoys their
-servers.
+`-cron` is three things in order: take a lock, so a long run is never joined by
+the next one; check for a newer release and install it; run one cycle and exit.
+
+**The one thing that cannot be bootstrapped is the credentials file** — it holds
+the mailbox password. The first scheduled run writes the annotated template to
+`~/.local/share/dmarc-monitor/credentials.env` and exits non-zero, so `MAILTO`
+tells you it is waiting. Fill it in, and the next run works. That is the only
+time anyone needs to log in to the server.
+
+Four details in that line are load-bearing, and each is a real failure:
+
+- **No `%` anywhere.** cron turns a percent sign into a newline, so the obvious
+  `"${B%/*}"` would silently truncate the command. Hence the separate variables.
+- **`mkdir` before the redirect.** A redirect into a directory that does not
+  exist fails the entry before anything runs.
+- **`HOME` is left alone.** Both the credentials and the state file are found
+  relative to it; a crontab that overrides `HOME` sends the program looking for
+  its password somewhere it is not.
+- **The trailing `|| echo` is what makes `MAILTO` work.** cron mails whatever a
+  job writes, so a job that redirects everything into a log mails nothing —
+  including on the day it fails. Detail goes to the log, one line goes to mail,
+  and only on failure.
+
+On arm64, change the asset name to `dmarc-monitor-linux-arm64`.
+
+`-watch` still exists if you would rather run it resident, polling on
+`POLL_INTERVAL`.
+
+## Releasing
+
+Servers install published releases and nothing else — never a branch, never a
+commit on main — so shipping is a deliberate act:
+
+```bash
+make release V=v0.1.0     # tags, pushes, and the workflow does the rest
+gh run watch
+```
+
+`.github/workflows/release.yml` re-runs the full gate, builds linux/amd64,
+linux/arm64 and darwin/arm64 with the version stamped in, generates
+`checksums.txt` from the very files it uploads, and publishes them.
+
+Each server picks the release up at its next scheduled run. `foundation/selfupdate`
+verifies the download against `checksums.txt` before replacing anything, and a
+mismatch aborts without touching the working binary — the monitor carries on
+with the build it has, which still sends alerts. Prereleases and drafts are
+ignored.
+
+The new binary is put in place with a rename, so the running process keeps its
+own inode and finishes the cycle it is in. The update takes effect at the next
+run; nothing is ever swapped out mid-cycle.
+
+That auto-update is also the sharpest edge in this repository: anything
+published under a `v*` tag runs on the server as the user holding the mailbox
+password. The checksums make the *transport* trustworthy, not the *contents* —
+what protects the contents is that cutting a tag is manual and CI has to pass
+first.
 
 ## How a cycle works
 
@@ -168,7 +197,10 @@ business/types            domainname, authresult, disposition, severity, email
 foundation/dmarcxml       RFC 7489 wire format, zip/gzip unwrapping
 foundation/config         the credentials file
 foundation/checkpoint     what carries over between runs
+foundation/selfupdate     installing published releases, checksum-verified
+foundation/lockfile       one run at a time
 foundation/logger         slog setup
+deploy/crontab.example    the entire deployment
 ```
 
 Business domains never import each other; `app/monitor` composes them, and
