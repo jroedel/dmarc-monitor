@@ -89,8 +89,8 @@ type flags struct {
 func run() error {
 	var f flags
 
-	flag.StringVar(&f.credentials, "credentials", "", "path to the credentials file (default ~/.local/share/dmarc-monitor/credentials.env)")
-	flag.StringVar(&f.state, "state", "", "path to the state file (default ~/.local/state/dmarc-monitor/state.json)")
+	flag.StringVar(&f.credentials, "credentials", "", "path to the credentials file (default: credentials.env beside the binary)")
+	flag.StringVar(&f.state, "state", "", "path to the state file (default: state.json beside the binary)")
 	flag.BoolVar(&f.initCreds, "init-credentials", false, "write a commented credentials template and exit")
 	flag.BoolVar(&f.check, "check", false, "verify the credentials parse and both servers are reachable, then exit")
 	flag.BoolVar(&f.once, "once", true, "run one cycle and exit")
@@ -377,7 +377,9 @@ func initCredentials(path string) error {
 		return err
 	}
 
-	fmt.Printf("Wrote a credentials template to %s (mode 0600).\n\n", path)
+	fmt.Printf("Wrote a credentials template to %s (mode 0600).\n", path)
+	fmt.Println("That is beside the binary, so one directory holds the whole installation.")
+	fmt.Println()
 	fmt.Println("Fill in these, at least:")
 	fmt.Println("  IMAP_USERNAME, IMAP_PASSWORD   the mailbox the reports arrive in")
 	fmt.Println("  SMTP_USERNAME, SMTP_PASSWORD   the relay the alert is sent through")

@@ -21,6 +21,8 @@ import (
 	"path/filepath"
 	"slices"
 	"time"
+
+	"github.com/jroedel/dmarc-monitor/foundation/apppath"
 )
 
 // State is what carries over between runs. Its JSON is the file format, so the
@@ -50,20 +52,25 @@ const currentVersion = 1
 // enough that the file does not grow without bound.
 const retention = 90 * 24 * time.Hour
 
-// DefaultPath returns where the state file lives: $XDG_STATE_HOME if set,
-// otherwise ~/.local/state. State is deliberately not kept next to the
-// credentials — it is regenerable, they are not.
+// Name is the state file's filename, wherever it sits.
+const Name = "state.json"
+
+// DefaultPath returns where the state file lives: beside the binary, with the
+// rest of the installation. A file left at the old ~/.local/state location is
+// still used if it is there — losing the state costs one noisy run, but there
+// is no reason to inflict even that.
 func DefaultPath() (string, error) {
-	if dir := os.Getenv("XDG_STATE_HOME"); dir != "" {
-		return filepath.Join(dir, "dmarc-monitor", "state.json"), nil
-	}
-
-	home, err := os.UserHomeDir()
+	beside, err := apppath.Beside(Name)
 	if err != nil {
-		return "", fmt.Errorf("checkpoint: locating home directory: %w", err)
+		return "", err
 	}
 
-	return filepath.Join(home, ".local", "state", "dmarc-monitor", "state.json"), nil
+	return apppath.Resolve(beside, legacyPath()), nil
+}
+
+// legacyPath is where the state lived before it moved beside the binary.
+func legacyPath() string {
+	return apppath.XDG("XDG_STATE_HOME", "dmarc-monitor", Name, ".local", "state")
 }
 
 // Open loads the state file, returning an empty store if it does not exist yet

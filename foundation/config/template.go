@@ -45,8 +45,12 @@ func Init(path string) error {
 const Template = `# dmarc-monitor credentials and settings.
 #
 # This file holds passwords. Keep it mode 0600 -- the program refuses to start
-# if it is anything else. It is never read from the repository; only from
-# ~/.local/share/dmarc-monitor/credentials.env (or $XDG_DATA_HOME).
+# if it is anything else.
+#
+# It belongs beside the binary, which on a server means ~/dmarc-monitor/, so
+# that one directory holds the whole installation. It is never read from the
+# repository. (A file left at the older ~/.local/share/dmarc-monitor/ location
+# is still honoured, so an existing install keeps working.)
 #
 # Format: KEY=value, one per line. Blank lines and #-comments are ignored,
 # including a trailing comment after a value -- so uncommenting a line below

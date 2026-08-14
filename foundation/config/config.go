@@ -23,13 +23,13 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/jroedel/dmarc-monitor/business/types/email"
 	"github.com/jroedel/dmarc-monitor/business/types/severity"
+	"github.com/jroedel/dmarc-monitor/foundation/apppath"
 )
 
 // ErrNotFound is returned by Load when the credentials file does not exist, so
@@ -122,15 +122,30 @@ const (
 	SecuritySTARTTLS Security = "starttls"
 )
 
-// DefaultPath returns where the credentials file lives: $XDG_DATA_HOME if the
-// variable is set, otherwise ~/.local/share.
+// Name is the credentials file's filename, wherever it sits.
+const Name = "credentials.env"
+
+// DefaultPath returns where the credentials file lives: beside the binary.
+//
+// One directory holds an entire installation — binary, credentials, state —
+// which is what makes deploying this two steps rather than a tour of the
+// filesystem. A file left at the old ~/.local/share location is still used if
+// it is there, so an installation made before this change keeps working; it is
+// never moved, because relocating somebody's credentials without being asked is
+// not a thing a monitoring program should do.
 func DefaultPath() (string, error) {
-	dir, err := dataDir()
+	beside, err := apppath.Beside(Name)
 	if err != nil {
 		return "", err
 	}
 
-	return filepath.Join(dir, "credentials.env"), nil
+	return apppath.Resolve(beside, legacyPath()), nil
+}
+
+// legacyPath is where the credentials lived before they moved beside the
+// binary.
+func legacyPath() string {
+	return apppath.XDG("XDG_DATA_HOME", "dmarc-monitor", Name, ".local", "share")
 }
 
 // Load reads, parses and validates the credentials file at path.
@@ -244,19 +259,6 @@ func indexComment(s string) int {
 	}
 
 	return -1
-}
-
-func dataDir() (string, error) {
-	if dir := os.Getenv("XDG_DATA_HOME"); dir != "" {
-		return filepath.Join(dir, "dmarc-monitor"), nil
-	}
-
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("config: locating home directory: %w", err)
-	}
-
-	return filepath.Join(home, ".local", "share", "dmarc-monitor"), nil
 }
 
 // parseInt, parseFloat, parseBool and parseDuration all take the value's own

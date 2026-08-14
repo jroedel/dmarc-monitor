@@ -1,15 +1,27 @@
-# dmarc-monitor — the whole deployment.
+# dmarc-monitor — the whole deployment, in two steps.
 #
-# Install with `crontab -e` on the server, once. There is nothing else to set up
-# and nothing to log in for again: the entry downloads the binary if it is
-# missing, and the binary updates itself from published releases from then on.
+#   1. Put your credentials at ~/dmarc-monitor/credentials.env
+#   2. Paste the block below into `crontab -e`
 #
-#   crontab -l | grep dmarc-monitor     # what is installed
-#   crontab -e                          # paste the block below
+# There is no binary to download by hand and nothing to install. The first
+# scheduled run fetches the binary into ~/dmarc-monitor/ and keeps it current
+# from then on. Everything the program owns lives in that one directory:
 #
-# Requires curl and a filled-in ~/.local/share/dmarc-monitor/credentials.env.
-# That file is the one thing that cannot be bootstrapped — it holds the mailbox
-# password — so it has to be put on the server by hand the first time.
+#   ~/dmarc-monitor/
+#     credentials.env   the mailbox and relay passwords   (you write this)
+#     dmarc-monitor     the binary                        (downloads itself)
+#     state.json        what it remembers between runs
+#     run.lock          held while a run is going
+#     cron.log          what the last runs did
+#
+# So the whole installation can be listed, copied, backed up or deleted in one
+# go, and nothing of it is anywhere else.
+#
+# For step 1, if you would rather have the annotated template than write the six
+# required keys by hand: let the first run happen with no credentials in place
+# and it writes the template there for you, then fill it in.
+#
+# Requires curl. Nothing else.
 
 # Where cron sends failures. A run that cannot reach the mailbox, or cannot send
 # an alert, exits non-zero and mails here — which is the only thing that would
@@ -44,7 +56,7 @@ MAILTO=you@example.com
 # one, and a hand-run copy cannot collide with a scheduled one.
 #
 #   min hour        dom mon dow
-0 * * * * H="$(TZ=America/Chicago date +\%H)"; [ "$H" = 08 ] || [ "$H" = 20 ] || exit 0; D="$HOME/.local/bin"; L="$HOME/.local/state/dmarc-monitor"; B="$D/dmarc-monitor"; mkdir -p "$D" "$L"; [ -x "$B" ] || { curl -fsSL "https://github.com/__REPO__/releases/latest/download/dmarc-monitor-linux-amd64" -o "$B" && chmod +x "$B"; }; "$B" -cron >> "$L/cron.log" 2>&1 || echo "dmarc-monitor failed; see $L/cron.log"
+0 * * * * H="$(TZ=America/Chicago date +\%H)"; [ "$H" = 08 ] || [ "$H" = 20 ] || exit 0; D="$HOME/dmarc-monitor"; B="$D/dmarc-monitor"; mkdir -p "$D"; [ -x "$B" ] || { curl -fsSL "https://github.com/__REPO__/releases/latest/download/dmarc-monitor-linux-amd64" -o "$B" && chmod +x "$B"; }; "$B" -cron >> "$D/cron.log" 2>&1 || echo "dmarc-monitor failed; see $D/cron.log"
 
 # Notes on the line above, in the order the traps bite:
 #
@@ -57,9 +69,9 @@ MAILTO=you@example.com
 #   into a directory that does not exist fails the whole entry before anything
 #   runs.
 #
-# * HOME is left alone deliberately. The credentials and state files are found
-#   relative to it, so a crontab that overrides HOME sends the program looking
-#   for its password somewhere it is not.
+# * HOME is left alone deliberately. The install directory is found relative to
+#   it, so a crontab that overrides HOME sends the program looking for its
+#   credentials somewhere they are not.
 #
 # * The binary is fetched only when absent. Updates are the program's own job,
 #   from published releases with verified checksums, so this line never has to
@@ -86,7 +98,7 @@ MAILTO=you@example.com
 #
 # Useful by hand, on the server:
 #
-#   ~/.local/bin/dmarc-monitor -version
-#   ~/.local/bin/dmarc-monitor -check              # mailbox and relay reachable?
-#   ~/.local/bin/dmarc-monitor -once -dry-run      # what would it send right now
-#   tail -n 50 ~/.local/state/dmarc-monitor/cron.log
+#   ~/dmarc-monitor/dmarc-monitor -version
+#   ~/dmarc-monitor/dmarc-monitor -check              # mailbox and relay reachable?
+#   ~/dmarc-monitor/dmarc-monitor -once -dry-run      # what would it send right now
+#   tail -n 50 ~/dmarc-monitor/cron.log
