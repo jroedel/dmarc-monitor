@@ -1,0 +1,26 @@
+# Claude Code local, per-machine settings
+**/.claude/settings.local.json
+**/.claude/worktrees/
+
+# Go
+*.exe
+*.test
+*.out
+coverage.*
+/bin/
+/dist/
+
+# Built binary
+/dmarc-monitor
+
+# Credentials. The real file lives in ~/.local/share/dmarc-monitor/, never in
+# the repository -- but a stray copy here would be one `git add -A` away from
+# being published, so refuse it by name as well.
+credentials.env
+*.credentials
+.env
+.env.local
+
+# Local, per-machine working area
+local/
+*.tmp
