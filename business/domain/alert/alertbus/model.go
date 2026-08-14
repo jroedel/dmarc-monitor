@@ -36,6 +36,22 @@ type Item struct {
 	Action   string
 }
 
+// Notice is a short operational message to the same people who get alerts: not
+// a finding, not graded, and not about DMARC at all.
+//
+// It exists because a monitor that updates itself silently is a monitor you
+// have to log in to verify — which is the thing the whole cron deployment was
+// meant to avoid. One mail when a new build lands is the cheapest possible
+// proof that the pipeline works end to end.
+//
+// It is a separate type from Alert on purpose. Alert refuses to render with no
+// items, because an alert with nothing in it is this program's worst failure;
+// a Notice has no items by nature and must not be forced through that shape.
+type Notice struct {
+	Subject string
+	Body    string
+}
+
 // Message is the rendered email, still as data. The Sender turns it into bytes
 // on the wire; a test turns it into a golden file.
 type Message struct {

@@ -11,31 +11,47 @@
 # That file is the one thing that cannot be bootstrapped — it holds the mailbox
 # password — so it has to be put on the server by hand the first time.
 
-# Times are Central US and follow daylight saving. CRON_TZ is understood by the
-# cron on Debian and Ubuntu; on a cron that ignores it the times below are
-# server-local instead, so check with `date` if it matters.
-CRON_TZ=America/Chicago
-
 # Where cron sends failures. A run that cannot reach the mailbox, or cannot send
 # an alert, exits non-zero and mails here — which is the only thing that would
 # otherwise go unnoticed, since a monitor that has silently stopped looks
 # exactly like a monitor with nothing to report. Leave it empty to disable.
 MAILTO=you@example.com
 
-# Reports arrive once a day. Twice is enough to catch one within twelve hours
-# and is gentle on the mail host; a run takes about a second.
+# Runs at 08:00 and 20:00 US Central, on a server in any timezone.
+#
+# Cron wakes hourly and the first clause throws away the 22 wakeups that are
+# not the right hour in Chicago. That looks roundabout, and there is a reason:
+#
+#   Debian and Ubuntu cron CANNOT schedule in another timezone. Its crontab(5)
+#   says so under LIMITATIONS -- "it currently does not support per-user
+#   timezones... even if a user specifies the TZ environment variable in his
+#   crontab this will affect only the commands executed in the crontab, not the
+#   execution of the crontab tasks themselves". A CRON_TZ line looks like it
+#   works, is silently ignored for scheduling, and leaves the job firing at
+#   German local time -- seven hours out. The hourly guard below is the
+#   workaround that same man page recommends.
+#
+# Asking Chicago what time it is, rather than computing an offset from Berlin,
+# is also what keeps this right across daylight saving. The two zones change on
+# different dates: for 28 days a year the gap is six hours instead of seven, so
+# a crontab with German clock times hardcoded is an hour wrong every March and
+# October. This fires exactly twice a day through all four transitions.
+#
+# Reports arrive once a day, so twice is enough to see one within twelve hours,
+# and it is gentle on the mail host; a run takes about a second.
 #
 # The binary takes a lock, so a run that overruns is never joined by the next
 # one, and a hand-run copy cannot collide with a scheduled one.
 #
 #   min hour        dom mon dow
-0 7,19 * * * D="$HOME/.local/bin"; L="$HOME/.local/state/dmarc-monitor"; B="$D/dmarc-monitor"; mkdir -p "$D" "$L"; [ -x "$B" ] || { curl -fsSL "https://github.com/__REPO__/releases/latest/download/dmarc-monitor-linux-amd64" -o "$B" && chmod +x "$B"; }; "$B" -cron >> "$L/cron.log" 2>&1 || echo "dmarc-monitor failed; see $L/cron.log"
+0 * * * * H="$(TZ=America/Chicago date +\%H)"; [ "$H" = 08 ] || [ "$H" = 20 ] || exit 0; D="$HOME/.local/bin"; L="$HOME/.local/state/dmarc-monitor"; B="$D/dmarc-monitor"; mkdir -p "$D" "$L"; [ -x "$B" ] || { curl -fsSL "https://github.com/__REPO__/releases/latest/download/dmarc-monitor-linux-amd64" -o "$B" && chmod +x "$B"; }; "$B" -cron >> "$L/cron.log" 2>&1 || echo "dmarc-monitor failed; see $L/cron.log"
 
 # Notes on the line above, in the order the traps bite:
 #
-# * No '%' anywhere. cron translates a percent sign into a newline, so the
-#   obvious "${B%/*}" for the directory would silently truncate the command.
-#   Hence the separate D and L variables.
+# * The backslash in `date +\%H` is required. cron translates an unescaped
+#   percent sign into a newline, which would truncate the command mid-guard.
+#   That is also why the directory is a separate D variable rather than the
+#   obvious "${B%/*}", which cannot be escaped its way out of trouble.
 #
 # * mkdir runs before the redirect's directory is needed, because a redirect
 #   into a directory that does not exist fails the whole entry before anything
@@ -61,6 +77,13 @@ MAILTO=you@example.com
 # On an arm64 server (a Pi, an Ampere VM) change the asset name to
 # dmarc-monitor-linux-arm64.
 
+# Check the timezone is actually available before trusting any of this. If
+# tzdata is missing, `date` falls back to UTC without complaining and the job
+# runs at 08:00 and 20:00 UTC instead -- two hours out in winter, three in
+# summer. `dmarc-monitor -check` reports this too.
+#
+#   TZ=America/Chicago date        # should print Central time, CST or CDT
+#
 # Useful by hand, on the server:
 #
 #   ~/.local/bin/dmarc-monitor -version

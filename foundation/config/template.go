@@ -120,6 +120,13 @@ ALERT_TO=
 
 #ALERT_COOLDOWN=72h
 
+# Mail the same recipients when the program installs a new version of itself.
+# Rare -- only when a release actually lands -- and it is how an unattended
+# deployment is verified: proof the pipeline reached the server, without
+# logging in to check. Set to false once that stops being interesting.
+
+#ALERT_ON_UPDATE=true
+
 # ------------------------------------------------------------------- triage
 # TRIAGE_FAILURE_RATE is the fraction of messages that may fail DMARC before a
 # domain is considered to have a problem. 0.02 = 2%. Forwarding breaks SPF as a

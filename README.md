@@ -70,14 +70,42 @@ missing; the binary keeps itself current from then on. `deploy/crontab.example`
 is the annotated version — `make crontab` prints it — and this is the line:
 
 ```cron
-CRON_TZ=America/Chicago
 MAILTO=you@example.com
 
-0 7,19 * * * D="$HOME/.local/bin"; L="$HOME/.local/state/dmarc-monitor"; B="$D/dmarc-monitor"; mkdir -p "$D" "$L"; [ -x "$B" ] || { curl -fsSL "https://github.com/jroedel/dmarc-monitor/releases/latest/download/dmarc-monitor-linux-amd64" -o "$B" && chmod +x "$B"; }; "$B" -cron >> "$L/cron.log" 2>&1 || echo "dmarc-monitor failed; see $L/cron.log"
+0 * * * * H="$(TZ=America/Chicago date +\%H)"; [ "$H" = 08 ] || [ "$H" = 20 ] || exit 0; D="$HOME/.local/bin"; L="$HOME/.local/state/dmarc-monitor"; B="$D/dmarc-monitor"; mkdir -p "$D" "$L"; [ -x "$B" ] || { curl -fsSL "https://github.com/jroedel/dmarc-monitor/releases/latest/download/dmarc-monitor-linux-amd64" -o "$B" && chmod +x "$B"; }; "$B" -cron >> "$L/cron.log" 2>&1 || echo "dmarc-monitor failed; see $L/cron.log"
 ```
 
-Twice a day, Central time, following daylight saving. Reports arrive once a
-day, so this catches one within twelve hours; a run takes about a second.
+08:00 and 20:00 US Central, on a server in any timezone. Reports arrive once a
+day, so this sees one within twelve hours; a run takes about a second.
+
+### Why it wakes hourly and throws most of it away
+
+**Debian and Ubuntu cron cannot schedule in another timezone.** `crontab(5)`
+says so under LIMITATIONS: it "does not support per-user timezones... even if a
+user specifies the `TZ` environment variable in his crontab this will affect
+only the commands executed in the crontab, not the execution of the crontab
+tasks themselves". A `CRON_TZ=America/Chicago` line *looks* like it works, is
+silently ignored for scheduling, and leaves a German server firing seven hours
+out. The hourly guard is the workaround that same man page recommends.
+
+Asking Chicago what time it is, rather than computing an offset from Berlin, is
+also what survives daylight saving. The two zones switch on different dates, so
+for **28 days a year the gap is six hours instead of seven** — a crontab with
+German clock times hardcoded is an hour wrong every March and October. The guard
+fires exactly twice a day through all four transitions, with no skipped or
+duplicated runs.
+
+`dmarc-monitor -check` prints what the schedule means in local time:
+
+```
+Local time here is 12:32 CEST; in America/Chicago it is 05:32 CDT.
+deploy/crontab.example runs at 08:00 and 20:00 America/Chicago,
+which is 15:00 CEST and 03:00 CEST here today.
+```
+
+It also fails loudly if the machine cannot resolve `America/Chicago` — without
+tzdata, the shell's `date` answers in UTC without complaining, which would move
+every run by two hours in winter and three in summer.
 
 `-cron` is three things in order: take a lock, so a long run is never joined by
 the next one; check for a newer release and install it; run one cycle and exit.
@@ -90,8 +118,10 @@ time anyone needs to log in to the server.
 
 Four details in that line are load-bearing, and each is a real failure:
 
-- **No `%` anywhere.** cron turns a percent sign into a newline, so the obvious
-  `"${B%/*}"` would silently truncate the command. Hence the separate variables.
+- **The backslash in `date +\%H` is required**, and there is no other `%` in the
+  line. cron turns an unescaped percent sign into a newline, which would truncate
+  the command mid-guard; that is also why the directory is a separate variable
+  rather than `"${B%/*}"`.
 - **`mkdir` before the redirect.** A redirect into a directory that does not
   exist fails the entry before anything runs.
 - **`HOME` is left alone.** Both the credentials and the state file are found
@@ -120,6 +150,14 @@ gh run watch
 `.github/workflows/release.yml` re-runs the full gate, builds linux/amd64,
 linux/arm64 and darwin/arm64 with the version stamped in, generates
 `checksums.txt` from the very files it uploads, and publishes them.
+
+Each server mails you when it takes one — subject `[dmarc] updated to v0.2.0 on
+<host>`, naming the versions, the binary it replaced and the release page. That
+is how an unattended deployment is verified: the mail arriving *is* the proof
+the pipeline reached the machine, without logging in to check. It is sent only
+when a build actually lands, before the cycle that follows, so it arrives even
+if that cycle then fails. `ALERT_ON_UPDATE=false` turns it off once it stops
+being interesting.
 
 Each server picks the release up at its next scheduled run. `foundation/selfupdate`
 verifies the download against `checksums.txt` before replacing anything, and a

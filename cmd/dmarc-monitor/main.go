@@ -55,6 +55,14 @@ var version = selfupdate.DevVersion
 // misconfiguration into arbitrary code execution.
 const updateRepo = "jroedel/dmarc-monitor"
 
+// scheduleZone is the timezone deploy/crontab.example schedules in. The crontab
+// guard asks the system for the hour in this zone, and if the zone cannot be
+// resolved the shell's date silently answers in UTC instead — which would move
+// every run by two hours in winter and three in summer, without an error
+// anywhere. -check resolves it here so that failure is found at install time by
+// someone who is looking, rather than months later by nobody.
+const scheduleZone = "America/Chicago"
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "dmarc-monitor: %v\n", err)
@@ -118,6 +126,11 @@ func run() error {
 		return err
 	}
 
+	var (
+		update  installed
+		updated bool
+	)
+
 	if f.cron {
 		lock, err := lockfile.Acquire(filepath.Join(filepath.Dir(statePath), "run.lock"))
 		if errors.Is(err, lockfile.ErrHeld) {
@@ -133,7 +146,7 @@ func run() error {
 		// Before the config is loaded, so that a server whose credentials are
 		// not filled in yet still picks up new builds.
 		if !f.noUpdate {
-			update(context.Background(), log)
+			update, updated = updateCheck(context.Background(), log)
 		}
 	}
 
@@ -200,6 +213,19 @@ func run() error {
 		log.Info("using local model for alert narratives", "endpoint", cfg.LLMEndpoint, "model", cfg.LLMModel)
 	}
 
+	alerts := alertbus.NewBusiness(log, alertStore, alertbus.Config{
+		From:          cfg.AlertFrom,
+		To:            cfg.AlertTo,
+		SubjectPrefix: cfg.AlertSubjectPrefix,
+	})
+
+	// Sent before the cycle, not after: this mail is proof that a new build
+	// reached the machine, and it should arrive even if the cycle that follows
+	// then fails to reach the mailbox.
+	if updated && cfg.NotifyOnUpdate {
+		notify(ctx, log, alerts, update, f.dryRun)
+	}
+
 	m := monitor.New(
 		log,
 		reportbus.NewBusiness(reportStore),
@@ -208,11 +234,7 @@ func run() error {
 			MinimumVolume:   cfg.MinimumVolume,
 			NewSourceVolume: cfg.NewSourceVolume,
 		}, explainer),
-		alertbus.NewBusiness(log, alertStore, alertbus.Config{
-			From:          cfg.AlertFrom,
-			To:            cfg.AlertTo,
-			SubjectPrefix: cfg.AlertSubjectPrefix,
-		}),
+		alerts,
 		state,
 		monitor.Config{
 			Floor:    cfg.AlertFloor,
@@ -246,7 +268,14 @@ func run() error {
 // run. Nothing is re-executed mid-cycle: a program that swapped itself out
 // halfway through reading a mailbox would be a much harder thing to reason
 // about than one that is simply newer tomorrow morning.
-func update(ctx context.Context, log *slog.Logger) {
+// installed describes an update that landed, for the notice sent afterwards.
+type installed struct {
+	from string
+	to   string
+	url  string
+}
+
+func updateCheck(ctx context.Context, log *slog.Logger) (installed, bool) {
 	updater := selfupdate.New(selfupdate.Config{
 		Repo:           updateRepo,
 		CurrentVersion: version,
@@ -258,11 +287,11 @@ func update(ctx context.Context, log *slog.Logger) {
 	case err != nil:
 		log.Warn("update check failed; carrying on with the current build", "version", version, "err", err)
 
-		return
+		return installed{}, false
 	case !available:
 		log.Debug("no newer release", "version", version)
 
-		return
+		return installed{}, false
 	}
 
 	log.Info("installing a newer release", "from", version, "to", release.Version, "url", release.URL)
@@ -270,10 +299,71 @@ func update(ctx context.Context, log *slog.Logger) {
 	if err := updater.Apply(ctx, release); err != nil {
 		log.Warn("update failed; carrying on with the current build", "version", version, "err", err)
 
-		return
+		return installed{}, false
 	}
 
 	log.Info("update installed; it takes effect at the next run", "version", release.Version)
+
+	return installed{from: version, to: release.Version, url: release.URL}, true
+}
+
+// notify mails the update notice, or prints it under -dry-run.
+//
+// Failures are logged and swallowed. The notice is a convenience — the update
+// has already happened and the log already records it — and a relay that is
+// refusing mail must not stop the cycle that is about to look for reports.
+func notify(ctx context.Context, log *slog.Logger, alerts *alertbus.Business, update installed, dryRun bool) {
+	path, err := os.Executable()
+	if err != nil {
+		path = "the installed binary"
+	}
+
+	notice := updateNotice(update, path)
+
+	if dryRun {
+		msg, err := alerts.RenderNotice(notice)
+		if err != nil {
+			log.Warn("could not render the update notice", "err", err)
+
+			return
+		}
+
+		fmt.Printf("DRY RUN — the update notice that would be sent:\n\nTo:      %s\nSubject: %s\n\n%s\n",
+			joinAddresses(msg), msg.Subject, msg.Body)
+
+		return
+	}
+
+	if err := alerts.Notify(ctx, notice); err != nil {
+		log.Warn("could not send the update notice; the update itself was fine", "err", err)
+	}
+}
+
+// updateNotice is the mail sent when a new build lands.
+//
+// Short on purpose. Its whole job is to say that the pipeline reached this
+// machine, so it names the versions, the host and the file, and stops. Anyone
+// who wants more has the release page linked.
+func updateNotice(update installed, path string) alertbus.Notice {
+	host, err := os.Hostname()
+	if err != nil {
+		host = "an unknown host"
+	}
+
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "dmarc-monitor updated itself on %s.\n\n", host)
+	fmt.Fprintf(&b, "  from     %s\n", update.from)
+	fmt.Fprintf(&b, "  to       %s\n", update.to)
+	fmt.Fprintf(&b, "  binary   %s\n", path)
+	fmt.Fprintf(&b, "  release  %s\n", update.url)
+	b.WriteString("\nThe new build takes effect at the next scheduled run; this one finished on the old one.\n")
+	b.WriteString("\nThis mail means the deployment pipeline works. Set ALERT_ON_UPDATE=false to stop it.\n")
+
+	return alertbus.Notice{
+		Subject: fmt.Sprintf("updated to %s on %s", update.to, host),
+		Body:    b.String(),
+	}
 }
 
 // initCredentials writes the template, and says where, because the path is
@@ -338,7 +428,40 @@ func check(ctx context.Context, log interface{ Info(string, ...any) }, cfg confi
 	}
 	fmt.Printf("Nothing below %s will be sent.\n", cfg.AlertFloor)
 
+	reportSchedule()
+
 	return nil
+}
+
+// reportSchedule prints what the scheduled times mean on this machine, and
+// complains if the timezone the crontab guard depends on is not installed.
+func reportSchedule() {
+	now := time.Now()
+
+	loc, err := time.LoadLocation(scheduleZone)
+	if err != nil {
+		fmt.Printf("\nWARNING: this machine cannot resolve %s (%v).\n", scheduleZone, err)
+		fmt.Println("The crontab guard asks for the hour in that zone; without it the shell's")
+		fmt.Println("date falls back to UTC silently and the runs happen at the wrong times.")
+		fmt.Println("Install tzdata:  sudo apt install tzdata")
+
+		return
+	}
+
+	fmt.Printf("\nLocal time here is %s; in %s it is %s.\n",
+		now.Format("15:04 MST"), scheduleZone, now.In(loc).Format("15:04 MST"))
+	fmt.Printf("deploy/crontab.example runs at 08:00 and 20:00 %s, which is %s and %s here today.\n",
+		scheduleZone,
+		nextAt(now, loc, 8).Local().Format("15:04 MST"),
+		nextAt(now, loc, 20).Local().Format("15:04 MST"))
+}
+
+// nextAt returns today's occurrence of an hour in loc, which is all that is
+// needed to show an operator what the schedule means in their own clock.
+func nextAt(now time.Time, loc *time.Location, hour int) time.Time {
+	there := now.In(loc)
+
+	return time.Date(there.Year(), there.Month(), there.Day(), hour, 0, 0, 0, loc)
 }
 
 // report prints the outcome of a single cycle to stdout. The log goes to
