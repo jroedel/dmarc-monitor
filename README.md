@@ -65,15 +65,60 @@ or DKIM, the alert about DMARC gets quarantined.
 
 ## Deploying it
 
-The whole deployment is one crontab entry. It downloads the binary if it is
-missing; the binary keeps itself current from then on. `deploy/crontab.example`
-is the annotated version — `make crontab` prints it — and this is the line:
+Two steps. No binary to download by hand, nothing to install.
+
+**1. Write the credentials** to `~/dmarc-monitor/credentials.env` on the server:
+
+```bash
+mkdir -p ~/dmarc-monitor && chmod 700 ~/dmarc-monitor
+cat > ~/dmarc-monitor/credentials.env <<'EOF'
+IMAP_HOST=mail.your-server.de
+IMAP_USERNAME=dmarc@yourdomain.example
+IMAP_PASSWORD=...
+SMTP_HOST=mail.your-server.de
+SMTP_USERNAME=alerts@yourdomain.example
+SMTP_PASSWORD=...
+ALERT_FROM=dmarc@yourdomain.example
+ALERT_TO=webmaster@yourdomain.example
+EOF
+chmod 600 ~/dmarc-monitor/credentials.env
+```
+
+Those are the only keys without a default. Everything else is documented in the
+annotated template — and if you would rather have that than the block above,
+skip this step, let step 2 run once, and it writes the template there for you.
+
+**2. Add the crontab entry** with `crontab -e` (`deploy/crontab.example` is the
+annotated version, and `make crontab` prints it):
 
 ```cron
 MAILTO=you@example.com
 
-0 * * * * H="$(TZ=America/Chicago date +\%H)"; [ "$H" = 08 ] || [ "$H" = 20 ] || exit 0; D="$HOME/.local/bin"; L="$HOME/.local/state/dmarc-monitor"; B="$D/dmarc-monitor"; mkdir -p "$D" "$L"; [ -x "$B" ] || { curl -fsSL "https://github.com/jroedel/dmarc-monitor/releases/latest/download/dmarc-monitor-linux-amd64" -o "$B" && chmod +x "$B"; }; "$B" -cron >> "$L/cron.log" 2>&1 || echo "dmarc-monitor failed; see $L/cron.log"
+0 * * * * H="$(TZ=America/Chicago date +\%H)"; [ "$H" = 08 ] || [ "$H" = 20 ] || exit 0; D="$HOME/dmarc-monitor"; B="$D/dmarc-monitor"; mkdir -p "$D"; [ -x "$B" ] || { curl -fsSL "https://github.com/jroedel/dmarc-monitor/releases/latest/download/dmarc-monitor-linux-amd64" -o "$B" && chmod +x "$B"; }; "$B" -cron >> "$D/cron.log" 2>&1 || echo "dmarc-monitor failed; see $D/cron.log"
 ```
+
+That is the whole deployment. The first scheduled run fetches the binary and
+keeps it current from then on.
+
+### One directory holds the installation
+
+```
+~/dmarc-monitor/
+  credentials.env   the mailbox and relay passwords   (you write this)
+  dmarc-monitor     the binary                        (downloads itself)
+  state.json        what it remembers between runs
+  run.lock          held while a run is going
+  cron.log          what the last runs did
+```
+
+So an install can be listed, copied, backed up or deleted in one go, and none
+of it is anywhere else. The credentials and state files are found beside the
+binary; a file left at the older `~/.local/share` or `~/.local/state` location
+is still honoured, so an installation predating this keeps working — nothing is
+moved automatically, because relocating somebody's credentials unasked is not a
+thing a monitoring program should do.
+
+### The schedule
 
 08:00 and 20:00 US Central, on a server in any timezone. Reports arrive once a
 day, so this sees one within twelve hours; a run takes about a second.
@@ -235,6 +280,7 @@ business/types            domainname, authresult, disposition, severity, email
 foundation/dmarcxml       RFC 7489 wire format, zip/gzip unwrapping
 foundation/config         the credentials file
 foundation/checkpoint     what carries over between runs
+foundation/apppath        where an installation's files live
 foundation/selfupdate     installing published releases, checksum-verified
 foundation/lockfile       one run at a time
 foundation/logger         slog setup
