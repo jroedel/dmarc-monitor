@@ -54,12 +54,19 @@ func toSMTPMessage(msg alertbus.Message) ([]byte, error) {
 	header("Content-Type", `text/plain; charset="utf-8"`)
 	header("Content-Transfer-Encoding", "base64")
 
-	// Tells well-behaved responders not to reply, and marks the mail as
-	// machine-generated so it never triggers an out-of-office loop back into
-	// the mailbox this program reads.
+	// Tells well-behaved responders not to reply, so an out-of-office cannot
+	// loop back into the mailbox this program reads. Auto-Submitted is the
+	// header RFC 3834 defines for exactly that; X-Auto-Response-Suppress is
+	// Microsoft's equivalent and is honoured by Exchange and Outlook.
+	//
+	// Precedence: bulk deliberately absent. It suppresses auto-replies too, but
+	// it also tells filters this is bulk mail, and some act on that. This
+	// message is the opposite of bulk: it is sent rarely, to one person, about
+	// something that needs doing today. Buying redundant loop suppression at
+	// the price of deliverability is a bad trade for the one mail that must
+	// not be missed.
 	header("Auto-Submitted", "auto-generated")
 	header("X-Auto-Response-Suppress", "All")
-	header("Precedence", "bulk")
 
 	b.WriteString("\r\n")
 	b.WriteString(encodeBase64(msg.Body))
