@@ -79,6 +79,48 @@ func (b *Business) Render(alert Alert) (Message, error) {
 	}, nil
 }
 
+// RenderNotice turns an operational notice into the message that would be sent.
+// Exported for the same reason Render is: a dry run must preview the real
+// thing, not an approximation of it.
+func (b *Business) RenderNotice(notice Notice) (Message, error) {
+	switch {
+	case b.from.IsZero():
+		return Message{}, fmt.Errorf("alertbus: no from address configured")
+	case len(b.to) == 0:
+		return Message{}, fmt.Errorf("alertbus: no recipients configured")
+	case notice.Subject == "":
+		return Message{}, fmt.Errorf("alertbus: refusing to send a notice with no subject")
+	}
+
+	subject := notice.Subject
+	if b.subjectPrefix != "" {
+		subject = b.subjectPrefix + " " + subject
+	}
+
+	return Message{
+		From:    b.from,
+		To:      b.to,
+		Subject: collapse(subject),
+		Body:    notice.Body,
+	}, nil
+}
+
+// Notify renders and delivers an operational notice.
+func (b *Business) Notify(ctx context.Context, notice Notice) error {
+	msg, err := b.RenderNotice(notice)
+	if err != nil {
+		return err
+	}
+
+	if err := b.sender.Send(ctx, msg); err != nil {
+		return fmt.Errorf("alertbus: sending notice: %w", err)
+	}
+
+	b.log.Info("alertbus: notice sent", "subject", notice.Subject, "recipients", len(b.to))
+
+	return nil
+}
+
 // Send renders and delivers the alert.
 func (b *Business) Send(ctx context.Context, alert Alert) error {
 	msg, err := b.Render(alert)

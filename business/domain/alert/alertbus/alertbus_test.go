@@ -147,3 +147,59 @@ func TestSendDelivers(t *testing.T) {
 		t.Errorf("recipient = %q, want %q", got, want)
 	}
 }
+
+// An update notice is the proof that an unattended deployment works, so it has
+// to survive the same scrutiny as an alert: prefixed, single-line subject,
+// delivered to the same people.
+func TestNoticeIsPrefixedAndDelivered(t *testing.T) {
+	sender := &capturingSender{}
+	business := newBusiness(sender)
+
+	notice := alertbus.Notice{
+		Subject: "updated to v1.2.0 on mail.example.com",
+		Body:    "dmarc-monitor updated itself.\n\n  from v1.1.0\n  to   v1.2.0\n",
+	}
+
+	if err := business.Notify(t.Context(), notice); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+
+	if len(sender.sent) != 1 {
+		t.Fatalf("sent %d messages, want 1", len(sender.sent))
+	}
+
+	msg := sender.sent[0]
+	switch {
+	case msg.Subject != "[dmarc] updated to v1.2.0 on mail.example.com":
+		t.Errorf("subject = %q", msg.Subject)
+	case msg.Body != notice.Body:
+		t.Errorf("body was rewritten: %q", msg.Body)
+	case msg.To[0].String() != "webmaster@example.com":
+		t.Errorf("recipient = %q", msg.To[0])
+	}
+}
+
+// A release tag is attacker-influenced in the same way a report is: it reaches
+// the subject line from outside.
+func TestNoticeSubjectCannotBeInjected(t *testing.T) {
+	sender := &capturingSender{}
+
+	notice := alertbus.Notice{
+		Subject: "updated to v1.2.0\r\nBcc: attacker@evil.example",
+		Body:    "x",
+	}
+
+	if err := newBusiness(sender).Notify(t.Context(), notice); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+
+	if strings.ContainsAny(sender.sent[0].Subject, "\r\n") {
+		t.Fatalf("injected CRLF survived: %q", sender.sent[0].Subject)
+	}
+}
+
+func TestNoticeWithoutSubjectIsRefused(t *testing.T) {
+	if _, err := newBusiness(&capturingSender{}).RenderNotice(alertbus.Notice{Body: "x"}); err == nil {
+		t.Error("rendered a notice with no subject")
+	}
+}

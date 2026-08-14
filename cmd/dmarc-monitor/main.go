@@ -118,6 +118,11 @@ func run() error {
 		return err
 	}
 
+	var (
+		update  installed
+		updated bool
+	)
+
 	if f.cron {
 		lock, err := lockfile.Acquire(filepath.Join(filepath.Dir(statePath), "run.lock"))
 		if errors.Is(err, lockfile.ErrHeld) {
@@ -133,7 +138,7 @@ func run() error {
 		// Before the config is loaded, so that a server whose credentials are
 		// not filled in yet still picks up new builds.
 		if !f.noUpdate {
-			update(context.Background(), log)
+			update, updated = updateCheck(context.Background(), log)
 		}
 	}
 
@@ -200,6 +205,19 @@ func run() error {
 		log.Info("using local model for alert narratives", "endpoint", cfg.LLMEndpoint, "model", cfg.LLMModel)
 	}
 
+	alerts := alertbus.NewBusiness(log, alertStore, alertbus.Config{
+		From:          cfg.AlertFrom,
+		To:            cfg.AlertTo,
+		SubjectPrefix: cfg.AlertSubjectPrefix,
+	})
+
+	// Sent before the cycle, not after: this mail is proof that a new build
+	// reached the machine, and it should arrive even if the cycle that follows
+	// then fails to reach the mailbox.
+	if updated && cfg.NotifyOnUpdate {
+		notify(ctx, log, alerts, update, f.dryRun)
+	}
+
 	m := monitor.New(
 		log,
 		reportbus.NewBusiness(reportStore),
@@ -208,11 +226,7 @@ func run() error {
 			MinimumVolume:   cfg.MinimumVolume,
 			NewSourceVolume: cfg.NewSourceVolume,
 		}, explainer),
-		alertbus.NewBusiness(log, alertStore, alertbus.Config{
-			From:          cfg.AlertFrom,
-			To:            cfg.AlertTo,
-			SubjectPrefix: cfg.AlertSubjectPrefix,
-		}),
+		alerts,
 		state,
 		monitor.Config{
 			Floor:    cfg.AlertFloor,
@@ -246,7 +260,14 @@ func run() error {
 // run. Nothing is re-executed mid-cycle: a program that swapped itself out
 // halfway through reading a mailbox would be a much harder thing to reason
 // about than one that is simply newer tomorrow morning.
-func update(ctx context.Context, log *slog.Logger) {
+// installed describes an update that landed, for the notice sent afterwards.
+type installed struct {
+	from string
+	to   string
+	url  string
+}
+
+func updateCheck(ctx context.Context, log *slog.Logger) (installed, bool) {
 	updater := selfupdate.New(selfupdate.Config{
 		Repo:           updateRepo,
 		CurrentVersion: version,
@@ -258,11 +279,11 @@ func update(ctx context.Context, log *slog.Logger) {
 	case err != nil:
 		log.Warn("update check failed; carrying on with the current build", "version", version, "err", err)
 
-		return
+		return installed{}, false
 	case !available:
 		log.Debug("no newer release", "version", version)
 
-		return
+		return installed{}, false
 	}
 
 	log.Info("installing a newer release", "from", version, "to", release.Version, "url", release.URL)
@@ -270,10 +291,71 @@ func update(ctx context.Context, log *slog.Logger) {
 	if err := updater.Apply(ctx, release); err != nil {
 		log.Warn("update failed; carrying on with the current build", "version", version, "err", err)
 
-		return
+		return installed{}, false
 	}
 
 	log.Info("update installed; it takes effect at the next run", "version", release.Version)
+
+	return installed{from: version, to: release.Version, url: release.URL}, true
+}
+
+// notify mails the update notice, or prints it under -dry-run.
+//
+// Failures are logged and swallowed. The notice is a convenience — the update
+// has already happened and the log already records it — and a relay that is
+// refusing mail must not stop the cycle that is about to look for reports.
+func notify(ctx context.Context, log *slog.Logger, alerts *alertbus.Business, update installed, dryRun bool) {
+	path, err := os.Executable()
+	if err != nil {
+		path = "the installed binary"
+	}
+
+	notice := updateNotice(update, path)
+
+	if dryRun {
+		msg, err := alerts.RenderNotice(notice)
+		if err != nil {
+			log.Warn("could not render the update notice", "err", err)
+
+			return
+		}
+
+		fmt.Printf("DRY RUN — the update notice that would be sent:\n\nTo:      %s\nSubject: %s\n\n%s\n",
+			joinAddresses(msg), msg.Subject, msg.Body)
+
+		return
+	}
+
+	if err := alerts.Notify(ctx, notice); err != nil {
+		log.Warn("could not send the update notice; the update itself was fine", "err", err)
+	}
+}
+
+// updateNotice is the mail sent when a new build lands.
+//
+// Short on purpose. Its whole job is to say that the pipeline reached this
+// machine, so it names the versions, the host and the file, and stops. Anyone
+// who wants more has the release page linked.
+func updateNotice(update installed, path string) alertbus.Notice {
+	host, err := os.Hostname()
+	if err != nil {
+		host = "an unknown host"
+	}
+
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "dmarc-monitor updated itself on %s.\n\n", host)
+	fmt.Fprintf(&b, "  from     %s\n", update.from)
+	fmt.Fprintf(&b, "  to       %s\n", update.to)
+	fmt.Fprintf(&b, "  binary   %s\n", path)
+	fmt.Fprintf(&b, "  release  %s\n", update.url)
+	b.WriteString("\nThe new build takes effect at the next scheduled run; this one finished on the old one.\n")
+	b.WriteString("\nThis mail means the deployment pipeline works. Set ALERT_ON_UPDATE=false to stop it.\n")
+
+	return alertbus.Notice{
+		Subject: fmt.Sprintf("updated to %s on %s", update.to, host),
+		Body:    b.String(),
+	}
 }
 
 // initCredentials writes the template, and says where, because the path is

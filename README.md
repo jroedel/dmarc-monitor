@@ -121,6 +121,14 @@ gh run watch
 linux/arm64 and darwin/arm64 with the version stamped in, generates
 `checksums.txt` from the very files it uploads, and publishes them.
 
+Each server mails you when it takes one — subject `[dmarc] updated to v0.2.0 on
+<host>`, naming the versions, the binary it replaced and the release page. That
+is how an unattended deployment is verified: the mail arriving *is* the proof
+the pipeline reached the machine, without logging in to check. It is sent only
+when a build actually lands, before the cycle that follows, so it arrives even
+if that cycle then fails. `ALERT_ON_UPDATE=false` turns it off once it stops
+being interesting.
+
 Each server picks the release up at its next scheduled run. `foundation/selfupdate`
 verifies the download against `checksums.txt` before replacing anything, and a
 mismatch aborts without touching the working binary — the monitor carries on

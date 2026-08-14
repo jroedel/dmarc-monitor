@@ -56,6 +56,7 @@ var known = map[string]bool{
 	"ALERT_SUBJECT_PREFIX": true,
 	"ALERT_FLOOR":          true,
 	"ALERT_COOLDOWN":       true,
+	"ALERT_ON_UPDATE":      true,
 
 	"TRIAGE_FAILURE_RATE":      true,
 	"TRIAGE_MIN_VOLUME":        true,
@@ -130,6 +131,9 @@ func build(values map[string]string) (Config, error) {
 	fail(err)
 
 	cfg.NewSourceVolume, err = parseInt(values, "TRIAGE_NEW_SOURCE_VOLUME", defaultNewSourceVol)
+	fail(err)
+
+	cfg.NotifyOnUpdate, err = parseBool(values, "ALERT_ON_UPDATE", true)
 	fail(err)
 
 	cfg.LLMEnabled, err = parseBool(values, "LLM_ENABLED", false)

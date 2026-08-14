@@ -73,6 +73,11 @@ type Config struct {
 	AlertTo            []email.Email
 	AlertSubjectPrefix string
 
+	// NotifyOnUpdate mails the same recipients when a new build installs
+	// itself. It is how an unattended deployment is verified without logging in
+	// to the server: one mail, only when a release actually lands.
+	NotifyOnUpdate bool
+
 	// AlertFloor is the severity at which an email is actually sent. Everything
 	// below it is logged and forgotten. This is the single most important knob
 	// in the file: raise it and the program goes quiet, lower it and it becomes
