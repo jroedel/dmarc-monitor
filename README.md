@@ -100,6 +100,26 @@ MAILTO=you@example.com
 That is the whole deployment. The first scheduled run fetches the binary and
 keeps it current from then on.
 
+### Starting it now instead of at the next scheduled hour
+
+There is no binary to invoke yet — the crontab line is what downloads it — so
+this is the same fetch, by hand:
+
+```bash
+D="$HOME/dmarc-monitor"; B="$D/dmarc-monitor"; mkdir -p "$D"; \
+  curl -fsSL "https://github.com/jroedel/dmarc-monitor/releases/latest/download/dmarc-monitor-linux-amd64" \
+  -o "$B" && chmod +x "$B" && "$B" -version
+```
+
+After that the usual checks work, and the first real run wants `-include-seen`
+once, to sweep up reports already sitting read in the mailbox:
+
+```bash
+~/dmarc-monitor/dmarc-monitor -check
+~/dmarc-monitor/dmarc-monitor -once -dry-run -include-seen
+~/dmarc-monitor/dmarc-monitor -once -include-seen
+```
+
 ### One directory holds the installation
 
 ```

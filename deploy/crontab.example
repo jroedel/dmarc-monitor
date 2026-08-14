@@ -96,6 +96,15 @@ MAILTO=you@example.com
 #
 #   TZ=America/Chicago date        # should print Central time, CST or CDT
 #
+# Nothing needs doing after the crontab entry is in: the next scheduled run
+# fetches the binary. To have it now rather than at 08:00 or 20:00 Central,
+# run the same fetch by hand -- note there is no binary to invoke yet, which
+# is why this is a curl and not a flag:
+#
+#   D="$HOME/dmarc-monitor"; B="$D/dmarc-monitor"; mkdir -p "$D"; \
+#     curl -fsSL "https://github.com/__REPO__/releases/latest/download/dmarc-monitor-linux-amd64" \
+#     -o "$B" && chmod +x "$B" && "$B" -version
+#
 # Useful by hand, on the server:
 #
 #   ~/dmarc-monitor/dmarc-monitor -version
