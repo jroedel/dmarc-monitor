@@ -1,6 +1,6 @@
 module github.com/jroedel/dmarc-monitor
 
-go 1.26.5
+go 1.26.6
 
 require (
 	github.com/emersion/go-imap/v2 v2.0.0-beta.8 // indirect

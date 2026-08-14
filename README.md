@@ -92,6 +92,19 @@ Persistent=true
 WantedBy=timers.target
 ```
 
+With cron instead:
+
+```cron
+# m  h        dom mon dow
+  17 6,18     *   *   *    /home/you/bin/dmarc-monitor -once -log json >> /home/you/.local/state/dmarc-monitor/cron.log 2>&1
+```
+
+Two things bite here. Give the binary an absolute path — cron's `PATH` is
+nearly empty. And leave `HOME` alone: the credentials and state files are found
+relative to it, so a crontab that unsets or overrides `HOME` will send the
+program looking for its credentials somewhere they are not. `MAILTO=` is worth
+setting if you would rather see failures as mail than in the log.
+
 Reporters send once a day. Polling faster than a few hours only annoys their
 servers.
 
@@ -162,14 +175,22 @@ Business domains never import each other; `app/monitor` composes them, and
 `app/monitor/convert.go` holds every crossing. Primitives live at the edges,
 strong types only in the Business layer. See `AGENTS.md`.
 
-## Known issue
+## The Go toolchain
 
-`make test` currently fails at `vuln-check`: Go 1.26.5 is installed and five
-standard-library advisories (GO-2026-6218, -6090, -6088, -5972, -5026, in
-`net/url`, `crypto/tls`, `encoding/xml`, `encoding/asn1` and `net/http`) are
-fixed in 1.26.6. All five are reachable from this program — it parses XML from
-strangers and speaks TLS to two servers — so the fix is to upgrade the
-toolchain, not to suppress the check. `make test-unit lint` passes.
+`go.mod` pins `go 1.26.6` rather than a bare `go 1.26`, and the pin is
+load-bearing. Five standard-library advisories fixed in 1.26.6 are reachable
+from this program — it parses XML written by strangers and speaks TLS to two
+servers — so `make test` fails its `vuln-check` on anything older.
+
+With the default `GOTOOLCHAIN=auto`, the `go` command downloads that exact
+toolchain the first time it builds here and caches it under `$GOPATH`. No root,
+and no dependence on whatever the distribution ships: Ubuntu's
+`longsleep/golang-backports` PPA was still on 1.26.5 when this was written, so
+`apt upgrade` would not have been enough.
+
+The build host is the only machine that needs Go at all. Cron runs a compiled
+static binary, so the toolchain version is a build-time property that travels
+baked into the artefact.
 
 ## Development
 
