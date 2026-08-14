@@ -109,10 +109,10 @@ func build(values map[string]string) (Config, error) {
 	cfg.SMTPPort, err = parseInt(values, "SMTP_PORT", defaultSMTPPort)
 	fail(err)
 
-	cfg.IMAPSecurity, err = parseSecurity(values, "IMAP_SECURITY", cfg.IMAPPort)
+	cfg.IMAPSecurity, err = parseSecurity(values, "IMAP_SECURITY", cfg.IMAPPort, cfg.IMAPHost)
 	fail(err)
 
-	cfg.SMTPSecurity, err = parseSecurity(values, "SMTP_SECURITY", cfg.SMTPPort)
+	cfg.SMTPSecurity, err = parseSecurity(values, "SMTP_SECURITY", cfg.SMTPPort, cfg.SMTPHost)
 	fail(err)
 
 	cfg.MarkSeen, err = parseBool(values, "IMAP_MARK_SEEN", true)
@@ -152,6 +152,7 @@ func build(values map[string]string) (Config, error) {
 	fail(err)
 
 	fail(requireFields(cfg))
+	fail(validateSMTP(cfg))
 	fail(validateRanges(cfg))
 
 	if len(errs) > 0 {
@@ -166,14 +167,16 @@ func build(values map[string]string) (Config, error) {
 func requireFields(cfg Config) error {
 	var missing []string
 
+	// The SMTP credentials are deliberately absent from this list. A relay on
+	// this machine usually wants none, and demanding them would rule out the
+	// arrangement that makes an alert inherit the host's own SPF standing and
+	// DKIM signature. They are checked as a pair instead, below.
 	for _, f := range []struct {
 		key   string
 		empty bool
 	}{
 		{"IMAP_USERNAME", cfg.IMAPUsername == ""},
 		{"IMAP_PASSWORD", cfg.IMAPPassword == ""},
-		{"SMTP_USERNAME", cfg.SMTPUsername == ""},
-		{"SMTP_PASSWORD", cfg.SMTPPassword == ""},
 	} {
 		if f.empty {
 			missing = append(missing, f.key)
@@ -185,6 +188,38 @@ func requireFields(cfg Config) error {
 	}
 
 	return fmt.Errorf("required and empty: %s", strings.Join(missing, ", "))
+}
+
+// validateSMTP holds the rules that keep a relaxed relay from becoming a leak.
+func validateSMTP(cfg Config) error {
+	var errs []error
+
+	// Half a credential is a typo, and the half that is present would be sent
+	// to a server that was not expecting it.
+	switch {
+	case cfg.SMTPUsername != "" && cfg.SMTPPassword == "":
+		errs = append(errs, fmt.Errorf("SMTP_PASSWORD: empty, but SMTP_USERNAME is set"))
+	case cfg.SMTPPassword != "" && cfg.SMTPUsername == "":
+		errs = append(errs, fmt.Errorf("SMTP_USERNAME: empty, but SMTP_PASSWORD is set"))
+	}
+
+	// Plaintext is a conversation anyone on the path can read, and if it
+	// carries a password they can keep it. Neither is acceptable to a host
+	// that is not this one.
+	if cfg.SMTPSecurity == SecurityNone && !IsLoopback(cfg.SMTPHost) {
+		errs = append(errs, fmt.Errorf("SMTP_SECURITY=none is only allowed for a relay on this machine; %q is not loopback", cfg.SMTPHost))
+	}
+
+	if cfg.SMTPSecurity == SecurityNone && cfg.SMTPUsername != "" {
+		errs = append(errs, fmt.Errorf("SMTP_SECURITY=none would send SMTP_PASSWORD in the clear; leave the credentials empty for a local relay, or use starttls"))
+	}
+
+	// The IMAP side authenticates unconditionally, so it has no such mode.
+	if cfg.IMAPSecurity == SecurityNone {
+		errs = append(errs, fmt.Errorf("IMAP_SECURITY=none is not supported; reading the mailbox always sends a password"))
+	}
+
+	return errors.Join(errs...)
 }
 
 func validateRanges(cfg Config) error {
@@ -206,16 +241,20 @@ func validateRanges(cfg Config) error {
 	return errors.Join(errs...)
 }
 
-// parseSecurity defaults from the port, because the port is what an operator
-// actually thinks in: 993 and 465 are implicit TLS, everything else upgrades.
-func parseSecurity(values map[string]string, key string, port int) (Security, error) {
+// parseSecurity defaults from the port and the host, because those are what an
+// operator actually thinks in: 993 and 465 are implicit TLS, a relay on this
+// machine's own port 25 needs nothing, and everything else upgrades.
+func parseSecurity(values map[string]string, key string, port int, host string) (Security, error) {
 	switch raw := strings.ToLower(values[key]); raw {
 	case "":
-		if port == 993 || port == 465 {
+		switch {
+		case port == 993 || port == 465:
 			return SecurityTLS, nil
+		case port == 25 && IsLoopback(host):
+			return SecurityNone, nil
+		default:
+			return SecuritySTARTTLS, nil
 		}
-
-		return SecuritySTARTTLS, nil
 
 	case string(SecurityTLS), "ssl", "implicit":
 		return SecurityTLS, nil
@@ -223,8 +262,11 @@ func parseSecurity(values map[string]string, key string, port int) (Security, er
 	case string(SecuritySTARTTLS):
 		return SecuritySTARTTLS, nil
 
+	case string(SecurityNone), "plain", "plaintext":
+		return SecurityNone, nil
+
 	default:
-		return "", fmt.Errorf("%s: %q is not tls or starttls", key, raw)
+		return "", fmt.Errorf("%s: %q is not tls, starttls or none", key, raw)
 	}
 }
 

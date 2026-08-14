@@ -88,10 +88,28 @@ IMAP_PASSWORD=
 # ------------------------------------------------------------------ the relay
 # Where the alert is sent from. Separate credentials on purpose: the address
 # that receives reports is often a role account that cannot send.
+#
+# If this machine runs its own mail server, prefer it over a remote relay:
+#
+#   SMTP_HOST=localhost
+#   SMTP_PORT=25
+#   (leave SMTP_USERNAME and SMTP_PASSWORD empty)
+#
+# An alert handed to the local mail server goes out as this host's own mail,
+# with the SPF standing and the DKIM signature the host already has. The same
+# alert pushed through someone else's relay has neither -- and once the domain
+# moves to p=quarantine or p=reject, that is the mail that gets quarantined.
+# The alert about DMARC failing is a poor thing to lose to DMARC.
+#
+# SMTP_SECURITY is tls (implicit, 465), starttls (587), or none. It defaults
+# from the port and the host: 465 is tls, port 25 on this machine is none, and
+# anything else upgrades with starttls. Plaintext is accepted only for a relay
+# on the loopback address, where there is no wire to intercept; it is refused
+# for any other host, and refused outright if a password is set.
 
 #SMTP_HOST=mail.your-server.de
 #SMTP_PORT=587
-#SMTP_SECURITY=starttls      # starttls (587) or tls (465)
+#SMTP_SECURITY=starttls      # starttls (587), tls (465), or none (local relay)
 SMTP_USERNAME=
 SMTP_PASSWORD=
 

@@ -1,12 +1,20 @@
 // Package smtpstore delivers alerts through an SMTP submission service.
 //
 // This is the Storage layer for the alert domain, and the only place in the
-// program that can affect anyone outside it. Two rules follow from that.
+// program that can affect anyone outside it. Three rules follow from that.
 //
-// TLS is mandatory in both modes and the server certificate is always verified.
+// Talking to a relay over a network means TLS, with the certificate verified.
 // A submission session sends a password and then sends mail as the domain; a
 // silent downgrade to plaintext would leak the first and let anyone forge the
 // second. A server that will not do STARTTLS is refused, not tolerated.
+//
+// The exception is a relay on the loopback address, where plaintext is allowed
+// and a certificate is not verified. That is not a relaxation of the rule but
+// the same rule applied honestly: nothing is on the wire to intercept. It earns
+// its keep because a message handed to the local mail server goes out as the
+// host's own mail — its SPF standing, its DKIM signature — while the same
+// message pushed through a remote relay has neither, and is exactly the mail a
+// tightened DMARC policy would then quarantine.
 //
 // And the relay is deliberately not the IMAP account. The address that collects
 // DMARC reports is usually a role mailbox with no send rights, and the alert
@@ -34,9 +42,19 @@ type Config struct {
 	Username string
 	Password string
 
-	// STARTTLS opens in the clear and upgrades — port 587. When false the
-	// session is TLS from the first byte — port 465.
-	STARTTLS bool
+	// Security is "tls" (implicit, port 465), "starttls" (port 587) or "none".
+	//
+	// A primitive rather than a type from the config package: this is the
+	// storage layer, and what reaches it is a string the config layer has
+	// already validated.
+	//
+	// "none" is plaintext and belongs to exactly one arrangement — the mail
+	// server on this same machine. Handing the message to it means the alert
+	// leaves the host the way the host's own mail does, with its SPF standing
+	// and its DKIM signature, instead of arriving from a relay that has
+	// neither. The connection never touches a network. Config refuses this
+	// mode for any host that is not loopback, and so does this package.
+	Security string
 
 	// Timeout bounds the whole submission.
 	Timeout time.Duration
@@ -124,7 +142,24 @@ func (s *Store) Check(ctx context.Context) error {
 // connect dials, secures and authenticates.
 func (s *Store) connect(ctx context.Context) (*smtp.Client, error) {
 	address := net.JoinHostPort(s.cfg.Host, strconv.Itoa(s.cfg.Port))
+
+	// Refused here as well as in the config layer. This is the last point
+	// before a password could go out in the clear, and a check at the edge that
+	// depends on a caller having done its own is not a check.
+	if s.cfg.Security == securityNone && !isLoopback(s.cfg.Host) {
+		return nil, fmt.Errorf("smtpstore: refusing to speak plaintext to %s; that is only allowed for a relay on this machine", s.cfg.Host)
+	}
+
 	tlsConfig := tls.Config{ServerName: s.cfg.Host, MinVersion: tls.VersionTLS12}
+
+	// A mail server on this machine almost always presents a self-signed
+	// certificate for a name that is not "localhost". Verifying it would mean
+	// refusing the one relay whose traffic provably never leaves the host —
+	// so on loopback the certificate is used for encryption and not for
+	// identity. Off loopback, verification stays mandatory.
+	if isLoopback(s.cfg.Host) {
+		tlsConfig.InsecureSkipVerify = true
+	}
 
 	dialer := net.Dialer{Timeout: s.cfg.Timeout}
 
@@ -139,7 +174,7 @@ func (s *Store) connect(ctx context.Context) (*smtp.Client, error) {
 		_ = conn.SetDeadline(time.Now().Add(s.cfg.Timeout))
 	}
 
-	if !s.cfg.STARTTLS {
+	if s.cfg.Security == securityTLS {
 		conn = tls.Client(conn, &tlsConfig)
 	}
 
@@ -150,7 +185,7 @@ func (s *Store) connect(ctx context.Context) (*smtp.Client, error) {
 		return nil, fmt.Errorf("smtpstore: greeting from %s: %w", address, err)
 	}
 
-	if s.cfg.STARTTLS {
+	if s.cfg.Security == securitySTARTTLS {
 		if ok, _ := client.Extension("STARTTLS"); !ok {
 			client.Close()
 
@@ -162,6 +197,14 @@ func (s *Store) connect(ctx context.Context) (*smtp.Client, error) {
 
 			return nil, fmt.Errorf("smtpstore: starting TLS with %s: %w", address, err)
 		}
+	}
+
+	// No username means no authentication, which is the normal shape of a
+	// local relay: it trusts the loopback connection rather than a password.
+	// Nothing is sent that could be intercepted, so there is nothing to
+	// protect and no reason to demand a credential that does not exist.
+	if s.cfg.Username == "" {
+		return client, nil
 	}
 
 	// PLAIN over an established TLS session. net/smtp refuses PLAIN on an

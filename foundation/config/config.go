@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -120,7 +121,33 @@ const (
 	// The upgrade is mandatory here — a server that will not do it is refused
 	// rather than silently spoken to in plaintext.
 	SecuritySTARTTLS Security = "starttls"
+
+	// SecurityNone is plaintext, and is accepted only for a relay on the
+	// loopback address. Handing a message to the mail server running on the
+	// same machine is a conversation that never touches a network, and it is
+	// how an alert picks up the host's own SPF standing and DKIM signature
+	// instead of arriving unauthenticated from somewhere else. Pointed at any
+	// other host it is a refused configuration, not a warning.
+	SecurityNone Security = "none"
 )
+
+// IsLoopback reports whether host names the local machine.
+//
+// It is deliberately a string test rather than a DNS lookup: this decides
+// whether plaintext is permitted, and a decision like that must not depend on
+// what a resolver says today.
+func IsLoopback(host string) bool {
+	switch strings.ToLower(strings.TrimSpace(host)) {
+	case "localhost", "localhost.localdomain", "ip6-localhost":
+		return true
+	}
+
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+
+	return false
+}
 
 // Name is the credentials file's filename, wherever it sits.
 const Name = "credentials.env"

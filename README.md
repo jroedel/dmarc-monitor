@@ -63,6 +63,22 @@ Six values have no default and must be filled in: `IMAP_USERNAME`,
 `ALERT_FROM` must be an address the relay will send as. If it fails your own SPF
 or DKIM, the alert about DMARC gets quarantined.
 
+That is a real trap once the domain moves past `p=none`, and the fix is to send
+through the mail server on the machine itself rather than a remote relay:
+
+```bash
+SMTP_HOST=localhost
+SMTP_PORT=25
+SMTP_USERNAME=
+SMTP_PASSWORD=
+```
+
+An alert handed to the local mail server leaves as the host's own mail, with the
+SPF standing and DKIM signature the host already has. Pushed through someone
+else's relay it has neither, and is exactly the mail a tightened policy
+quarantines. Plaintext is accepted only for a loopback relay — there is no wire
+to intercept — and is refused for any other host, or if a password is set.
+
 ## Deploying it
 
 Two steps. No binary to download by hand, nothing to install.

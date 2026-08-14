@@ -91,10 +91,12 @@ IMAP_PORT=nine-nine-three
 ALERT_FLOOR=panic
 `, 0o600))
 	if err == nil {
-		t.Fatal("accepted a file with four problems")
+		t.Fatal("accepted a file with three problems")
 	}
 
-	for _, want := range []string{"IMAP_PORT", "ALERT_FLOOR", "ALERT_FROM", "SMTP_USERNAME"} {
+	// SMTP_USERNAME is deliberately absent: a local relay wants no credentials,
+	// so its absence is no longer a problem to report.
+	for _, want := range []string{"IMAP_PORT", "ALERT_FLOOR", "ALERT_FROM"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error does not mention %s: %v", want, err)
 		}
@@ -208,5 +210,104 @@ func TestInitRefusesToOverwrite(t *testing.T) {
 
 	if err := config.Init(path); err == nil {
 		t.Error("Init overwrote an existing credentials file")
+	}
+}
+
+// A relay on this machine is the arrangement that lets an alert go out as the
+// host's own mail — SPF standing and DKIM signature included — so it has to be
+// configurable without credentials.
+func TestLocalRelayNeedsNoCredentials(t *testing.T) {
+	cfg, err := config.Load(write(t, `
+IMAP_USERNAME=reports@example.com
+IMAP_PASSWORD=hunter2
+SMTP_HOST=localhost
+SMTP_PORT=25
+ALERT_FROM=dmarc@example.com
+ALERT_TO=webmaster@example.com
+`, 0o600))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	switch {
+	case cfg.SMTPSecurity != config.SecurityNone:
+		t.Errorf("security = %q, want none for port 25 on loopback", cfg.SMTPSecurity)
+	case cfg.SMTPUsername != "":
+		t.Errorf("username = %q, want empty", cfg.SMTPUsername)
+	}
+}
+
+// Plaintext off the loopback address is a conversation strangers can read.
+func TestPlaintextIsRefusedForRemoteRelays(t *testing.T) {
+	_, err := config.Load(write(t, minimal+`
+SMTP_HOST=mail.your-server.de
+SMTP_SECURITY=none
+`, 0o600))
+	if err == nil {
+		t.Fatal("accepted plaintext to a remote relay")
+	}
+	if !strings.Contains(err.Error(), "loopback") {
+		t.Errorf("error does not explain the refusal: %v", err)
+	}
+}
+
+// A password on a plaintext connection would be handed over in the clear, even
+// on loopback where the rest is harmless.
+func TestPasswordOverPlaintextIsRefused(t *testing.T) {
+	_, err := config.Load(write(t, `
+IMAP_USERNAME=reports@example.com
+IMAP_PASSWORD=hunter2
+SMTP_HOST=127.0.0.1
+SMTP_SECURITY=none
+SMTP_USERNAME=alerts@example.com
+SMTP_PASSWORD=hunter3
+ALERT_FROM=dmarc@example.com
+ALERT_TO=webmaster@example.com
+`, 0o600))
+	if err == nil {
+		t.Fatal("accepted a password on a plaintext connection")
+	}
+	if !strings.Contains(err.Error(), "clear") {
+		t.Errorf("error does not explain the refusal: %v", err)
+	}
+}
+
+// Half a credential is a typo, and the half present would be sent to a server
+// not expecting it.
+func TestHalfAnSMTPCredentialIsRefused(t *testing.T) {
+	for name, extra := range map[string]string{
+		"username without password": "SMTP_USERNAME=alerts@example.com\n",
+		"password without username": "SMTP_PASSWORD=hunter3\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := config.Load(write(t, `
+IMAP_USERNAME=reports@example.com
+IMAP_PASSWORD=hunter2
+ALERT_FROM=dmarc@example.com
+ALERT_TO=webmaster@example.com
+`+extra, 0o600))
+			if err == nil {
+				t.Error("accepted half a credential")
+			}
+		})
+	}
+}
+
+// Reading the mailbox always sends a password, so it has no plaintext mode.
+func TestIMAPHasNoPlaintextMode(t *testing.T) {
+	_, err := config.Load(write(t, minimal+"IMAP_SECURITY=none\n", 0o600))
+	if err == nil {
+		t.Fatal("accepted plaintext IMAP")
+	}
+}
+
+// The remote default must not have moved.
+func TestRemoteRelayStillDefaultsToSTARTTLS(t *testing.T) {
+	cfg, err := config.Load(write(t, minimal, 0o600))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.SMTPSecurity != config.SecuritySTARTTLS {
+		t.Errorf("security = %q, want starttls", cfg.SMTPSecurity)
 	}
 }
