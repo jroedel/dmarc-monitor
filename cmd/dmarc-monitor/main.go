@@ -190,7 +190,7 @@ func run() error {
 		Port:     cfg.SMTPPort,
 		Username: cfg.SMTPUsername,
 		Password: cfg.SMTPPassword,
-		STARTTLS: cfg.SMTPSecurity == config.SecuritySTARTTLS,
+		Security: string(cfg.SMTPSecurity),
 	})
 
 	if f.check {
