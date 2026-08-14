@@ -9,6 +9,7 @@
 //	dmarc-monitor -check              prove the mailbox and relay are reachable
 //	dmarc-monitor -once -dry-run      run a full cycle, print the alert, send nothing
 //	dmarc-monitor -once               run a full cycle for real
+//	dmarc-monitor -cron               what the crontab runs: lock, self-update, one cycle
 //	dmarc-monitor -watch              poll forever
 package main
 
@@ -17,8 +18,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -32,8 +36,24 @@ import (
 	"github.com/jroedel/dmarc-monitor/business/domain/triage/triagebus"
 	"github.com/jroedel/dmarc-monitor/foundation/checkpoint"
 	"github.com/jroedel/dmarc-monitor/foundation/config"
+	"github.com/jroedel/dmarc-monitor/foundation/lockfile"
 	"github.com/jroedel/dmarc-monitor/foundation/logger"
+	"github.com/jroedel/dmarc-monitor/foundation/selfupdate"
 )
+
+// version is stamped at link time by the release build:
+//
+//	go build -ldflags "-X main.version=v1.2.3"
+//
+// An unstamped build reports "dev" and is treated by the updater as older than
+// any published release, so a hand-built binary left on a server adopts the
+// real one at the next run.
+var version = selfupdate.DevVersion
+
+// updateRepo is where updates come from. A constant rather than a setting: a
+// credentials file that could redirect the update source would turn a mail
+// misconfiguration into arbitrary code execution.
+const updateRepo = "jroedel/dmarc-monitor"
 
 func main() {
 	if err := run(); err != nil {
@@ -53,6 +73,9 @@ type flags struct {
 	includeSeen bool
 	debug       bool
 	logFormat   string
+	cron        bool
+	noUpdate    bool
+	showVersion bool
 }
 
 func run() error {
@@ -66,9 +89,18 @@ func run() error {
 	flag.BoolVar(&f.watch, "watch", false, "poll on the configured interval until interrupted")
 	flag.BoolVar(&f.dryRun, "dry-run", false, "print the alert that would be sent; send nothing, change nothing")
 	flag.BoolVar(&f.includeSeen, "include-seen", false, "examine every message, not only unread ones (for a first run over an existing archive)")
+	flag.BoolVar(&f.cron, "cron", false, "what a crontab entry runs: take the lock, self-update, run one cycle, exit")
+	flag.BoolVar(&f.noUpdate, "no-update", false, "with -cron, skip the self-update check")
+	flag.BoolVar(&f.showVersion, "version", false, "print the version and exit")
 	flag.BoolVar(&f.debug, "debug", false, "log at debug level")
 	flag.StringVar(&f.logFormat, "log", "text", "log format: text or json")
 	flag.Parse()
+
+	if f.showVersion {
+		fmt.Printf("dmarc-monitor %s (%s/%s, %s)\n", version, runtime.GOOS, runtime.GOARCH, runtime.Version())
+
+		return nil
+	}
 
 	log := logger.New(os.Stderr, logger.Format(f.logFormat), f.debug)
 
@@ -81,17 +113,46 @@ func run() error {
 		return initCredentials(credentialsPath)
 	}
 
-	cfg, err := config.Load(credentialsPath)
+	statePath, err := resolve(f.state, checkpoint.DefaultPath)
 	if err != nil {
-		if errors.Is(err, config.ErrNotFound) {
-			return fmt.Errorf("%w\n\nRun 'dmarc-monitor -init-credentials' to write a template there, then fill it in", err)
-		}
-
 		return err
 	}
 
-	statePath, err := resolve(f.state, checkpoint.DefaultPath)
+	if f.cron {
+		lock, err := lockfile.Acquire(filepath.Join(filepath.Dir(statePath), "run.lock"))
+		if errors.Is(err, lockfile.ErrHeld) {
+			log.Info("another run is still going; leaving it to finish")
+
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		defer lock.Release()
+
+		// Before the config is loaded, so that a server whose credentials are
+		// not filled in yet still picks up new builds.
+		if !f.noUpdate {
+			update(context.Background(), log)
+		}
+	}
+
+	cfg, err := config.Load(credentialsPath)
 	if err != nil {
+		if errors.Is(err, config.ErrNotFound) {
+			// On a server this is the first scheduled run after the crontab
+			// entry was installed. Leaving the template behind means the only
+			// remaining step is to fill it in — the binary bootstrapped
+			// everything it possibly could.
+			if f.cron {
+				if initErr := config.Init(credentialsPath); initErr == nil {
+					return fmt.Errorf("%w\n\nA template has been written there. Fill in the mailbox and relay credentials", err)
+				}
+			}
+
+			return fmt.Errorf("%w\n\nRun 'dmarc-monitor -init-credentials' to write a template there, then fill it in", err)
+		}
+
 		return err
 	}
 
@@ -160,7 +221,7 @@ func run() error {
 		},
 	)
 
-	if f.watch {
+	if f.watch && !f.cron {
 		return m.Run(ctx, cfg.PollInterval)
 	}
 
@@ -172,6 +233,47 @@ func run() error {
 	report(result, f.dryRun)
 
 	return nil
+}
+
+// update checks for a newer published release and installs it.
+//
+// Every failure here is logged and swallowed. An update is a convenience; the
+// monitor's job is to read the mailbox, and it can do that perfectly well on
+// the build it already has. GitHub being unreachable must never be the reason a
+// webmaster is not told their mail is being rejected.
+//
+// The new binary lands on disk but does not take effect until the next cron
+// run. Nothing is re-executed mid-cycle: a program that swapped itself out
+// halfway through reading a mailbox would be a much harder thing to reason
+// about than one that is simply newer tomorrow morning.
+func update(ctx context.Context, log *slog.Logger) {
+	updater := selfupdate.New(selfupdate.Config{
+		Repo:           updateRepo,
+		CurrentVersion: version,
+		AssetName:      fmt.Sprintf("dmarc-monitor-%s-%s", runtime.GOOS, runtime.GOARCH),
+	})
+
+	release, available, err := updater.Latest(ctx)
+	switch {
+	case err != nil:
+		log.Warn("update check failed; carrying on with the current build", "version", version, "err", err)
+
+		return
+	case !available:
+		log.Debug("no newer release", "version", version)
+
+		return
+	}
+
+	log.Info("installing a newer release", "from", version, "to", release.Version, "url", release.URL)
+
+	if err := updater.Apply(ctx, release); err != nil {
+		log.Warn("update failed; carrying on with the current build", "version", version, "err", err)
+
+		return
+	}
+
+	log.Info("update installed; it takes effect at the next run", "version", release.Version)
 }
 
 // initCredentials writes the template, and says where, because the path is

@@ -1,0 +1,69 @@
+# dmarc-monitor — the whole deployment.
+#
+# Install with `crontab -e` on the server, once. There is nothing else to set up
+# and nothing to log in for again: the entry downloads the binary if it is
+# missing, and the binary updates itself from published releases from then on.
+#
+#   crontab -l | grep dmarc-monitor     # what is installed
+#   crontab -e                          # paste the block below
+#
+# Requires curl and a filled-in ~/.local/share/dmarc-monitor/credentials.env.
+# That file is the one thing that cannot be bootstrapped — it holds the mailbox
+# password — so it has to be put on the server by hand the first time.
+
+# Times are Central US and follow daylight saving. CRON_TZ is understood by the
+# cron on Debian and Ubuntu; on a cron that ignores it the times below are
+# server-local instead, so check with `date` if it matters.
+CRON_TZ=America/Chicago
+
+# Where cron sends failures. A run that cannot reach the mailbox, or cannot send
+# an alert, exits non-zero and mails here — which is the only thing that would
+# otherwise go unnoticed, since a monitor that has silently stopped looks
+# exactly like a monitor with nothing to report. Leave it empty to disable.
+MAILTO=you@example.com
+
+# Reports arrive once a day. Twice is enough to catch one within twelve hours
+# and is gentle on the mail host; a run takes about a second.
+#
+# The binary takes a lock, so a run that overruns is never joined by the next
+# one, and a hand-run copy cannot collide with a scheduled one.
+#
+#   min hour        dom mon dow
+0 7,19 * * * D="$HOME/.local/bin"; L="$HOME/.local/state/dmarc-monitor"; B="$D/dmarc-monitor"; mkdir -p "$D" "$L"; [ -x "$B" ] || { curl -fsSL "https://github.com/__REPO__/releases/latest/download/dmarc-monitor-linux-amd64" -o "$B" && chmod +x "$B"; }; "$B" -cron >> "$L/cron.log" 2>&1 || echo "dmarc-monitor failed; see $L/cron.log"
+
+# Notes on the line above, in the order the traps bite:
+#
+# * No '%' anywhere. cron translates a percent sign into a newline, so the
+#   obvious "${B%/*}" for the directory would silently truncate the command.
+#   Hence the separate D and L variables.
+#
+# * mkdir runs before the redirect's directory is needed, because a redirect
+#   into a directory that does not exist fails the whole entry before anything
+#   runs.
+#
+# * HOME is left alone deliberately. The credentials and state files are found
+#   relative to it, so a crontab that overrides HOME sends the program looking
+#   for its password somewhere it is not.
+#
+# * The binary is fetched only when absent. Updates are the program's own job,
+#   from published releases with verified checksums, so this line never has to
+#   change again.
+#
+# * The trailing `|| echo` is what makes MAILTO work. cron mails whatever a job
+#   writes, so a job that redirects everything into a log is a job that mails
+#   nothing -- including on the day it fails. Sending the detail to the log and
+#   one line to stdout on failure means a quiet mailbox on a normal day and a
+#   mail on a bad one.
+#
+# * cron.log grows by a few lines twice a day. If that ever matters:
+#   /etc/logrotate.d, or add `-log json` and ship it somewhere.
+#
+# On an arm64 server (a Pi, an Ampere VM) change the asset name to
+# dmarc-monitor-linux-arm64.
+
+# Useful by hand, on the server:
+#
+#   ~/.local/bin/dmarc-monitor -version
+#   ~/.local/bin/dmarc-monitor -check              # mailbox and relay reachable?
+#   ~/.local/bin/dmarc-monitor -once -dry-run      # what would it send right now
+#   tail -n 50 ~/.local/state/dmarc-monitor/cron.log
