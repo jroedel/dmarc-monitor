@@ -16,6 +16,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/jroedel/dmarc-monitor/business/types/email"
@@ -71,7 +72,13 @@ func (b *Business) Render(alert Alert) (Message, error) {
 		alert.Generated = time.Now()
 	}
 
+	id, err := email.GenerateMessageID(b.from)
+	if err != nil {
+		return Message{}, fmt.Errorf("alertbus: rendering alert: %w", err)
+	}
+
 	return Message{
+		ID:      id,
 		From:    b.from,
 		To:      b.to,
 		Subject: subject(b.subjectPrefix, alert),
@@ -97,7 +104,13 @@ func (b *Business) RenderNotice(notice Notice) (Message, error) {
 		subject = b.subjectPrefix + " " + subject
 	}
 
+	id, err := email.GenerateMessageID(b.from)
+	if err != nil {
+		return Message{}, fmt.Errorf("alertbus: rendering notice: %w", err)
+	}
+
 	return Message{
+		ID:      id,
 		From:    b.from,
 		To:      b.to,
 		Subject: collapse(subject),
@@ -105,37 +118,59 @@ func (b *Business) RenderNotice(notice Notice) (Message, error) {
 	}, nil
 }
 
-// Notify renders and delivers an operational notice.
-func (b *Business) Notify(ctx context.Context, notice Notice) error {
+// Notify renders and delivers an operational notice, and returns the message it
+// sent.
+//
+// The message comes back so the caller holds the same Message-ID the receiving
+// server will log. "It was sent" and "it arrived" are different claims, and
+// without the id there is nothing to carry an investigation from one to the
+// other.
+func (b *Business) Notify(ctx context.Context, notice Notice) (Message, error) {
 	msg, err := b.RenderNotice(notice)
 	if err != nil {
-		return err
+		return Message{}, err
 	}
 
 	if err := b.sender.Send(ctx, msg); err != nil {
-		return fmt.Errorf("alertbus: sending notice: %w", err)
+		return Message{}, fmt.Errorf("alertbus: sending notice %s: %w", msg.ID, err)
 	}
 
-	b.log.Info("alertbus: notice sent", "subject", notice.Subject, "recipients", len(b.to))
+	b.log.Info("alertbus: notice sent",
+		"subject", notice.Subject,
+		"message-id", msg.ID.String(),
+		"to", addresses(b.to))
 
-	return nil
+	return msg, nil
 }
 
-// Send renders and delivers the alert.
-func (b *Business) Send(ctx context.Context, alert Alert) error {
+// Send renders and delivers the alert, and returns the message it sent. The id
+// comes back for the same reason it does from Notify.
+func (b *Business) Send(ctx context.Context, alert Alert) (Message, error) {
 	msg, err := b.Render(alert)
 	if err != nil {
-		return err
+		return Message{}, err
 	}
 
 	if err := b.sender.Send(ctx, msg); err != nil {
-		return fmt.Errorf("alertbus: sending alert: %w", err)
+		return Message{}, fmt.Errorf("alertbus: sending alert %s: %w", msg.ID, err)
 	}
 
 	b.log.Info("alertbus: alert sent",
 		"severity", alert.Severity.String(),
 		"items", len(alert.Items),
-		"recipients", len(b.to))
+		"message-id", msg.ID.String(),
+		"to", addresses(b.to))
 
-	return nil
+	return msg, nil
+}
+
+// addresses renders the recipients for a log line. The count alone was what
+// this used to log, and a count cannot be searched for in a mail server's log.
+func addresses(to []email.Email) string {
+	out := make([]string, 0, len(to))
+	for _, addr := range to {
+		out = append(out, addr.String())
+	}
+
+	return strings.Join(out, ", ")
 }

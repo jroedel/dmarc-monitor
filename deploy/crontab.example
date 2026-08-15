@@ -109,5 +109,11 @@ MAILTO=you@example.com
 #
 #   ~/dmarc-monitor/dmarc-monitor -version
 #   ~/dmarc-monitor/dmarc-monitor -check              # mailbox and relay reachable?
+#   ~/dmarc-monitor/dmarc-monitor -test-alert         # send one, then go look for it
 #   ~/dmarc-monitor/dmarc-monitor -once -dry-run      # what would it send right now
 #   tail -n 50 ~/dmarc-monitor/cron.log
+#
+# -check sends nothing and can be run freely. -test-alert sends one real message
+# to the alert recipients and prints its Message-ID -- worth doing once after
+# install, because a relay that authenticates is not the same as a mailbox that
+# receives, and a filtered alert looks exactly like a quiet month.

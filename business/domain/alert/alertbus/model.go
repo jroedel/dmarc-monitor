@@ -55,6 +55,11 @@ type Notice struct {
 // Message is the rendered email, still as data. The Sender turns it into bytes
 // on the wire; a test turns it into a golden file.
 type Message struct {
+	// ID is minted when the message is rendered, not when it is sent, so that
+	// it can be logged either way round. A send that fails still names the
+	// message it failed to send, and a dry run previews the real id rather
+	// than a placeholder.
+	ID      email.MessageID
 	From    email.Email
 	To      []email.Email
 	Subject string
