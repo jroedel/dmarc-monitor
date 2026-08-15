@@ -38,9 +38,17 @@ make build                     # or: go build ./cmd/dmarc-monitor
 ./dmarc-monitor -init-credentials
 $EDITOR ~/.local/share/dmarc-monitor/credentials.env
 ./dmarc-monitor -check         # proves the mailbox and relay both work
+./dmarc-monitor -test-alert    # sends one real message, so you can go find it
 ./dmarc-monitor -once -dry-run # full cycle, prints the alert, sends nothing
 ./dmarc-monitor -once          # for real
 ```
+
+`-check` and `-test-alert` answer different questions. `-check` proves the relay
+accepts a connection and a password; it sends nothing, so it can be run as often
+as you like. `-test-alert` proves the rest of the trip — that a message rendered
+by this program, with these headers, from this address, actually reaches a human
+rather than a spam folder. It prints the `Message-ID` it sent, which is the
+string to search a mail server's log for when the answer is no.
 
 Only unread messages are examined — `\Seen` is what makes the mailbox its own
 queue, and a report a human opened by hand is one they are looking at. For a
@@ -307,7 +315,7 @@ an API key.
 ## Layout
 
 ```
-cmd/dmarc-monitor      flags, wiring, the -check and -init-credentials paths
+cmd/dmarc-monitor      flags, wiring, the -check/-test-alert/-init-credentials paths
 app/monitor            the cycle; the only package that knows all three domains
 business/domain/report    reportbus  + stores/imapstore
 business/domain/triage    triagebus  + stores/kronkllm

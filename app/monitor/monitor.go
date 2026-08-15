@@ -154,7 +154,10 @@ func (m *Monitor) RunOnce(ctx context.Context) (Result, error) {
 		return result, nil
 	}
 
-	if err := m.alert.Send(ctx, toBusAlert(verdict, now)); err != nil {
+	// The sent message is discarded here on purpose: alertbus has already logged
+	// its Message-ID, and the cycle's Result is about what was found, not about
+	// the wire format of the mail that reported it.
+	if _, err := m.alert.Send(ctx, toBusAlert(verdict, now)); err != nil {
 		// Deliberately fatal to the cycle: nothing is learned and nothing is
 		// acknowledged, so the next run tries again with the same reports.
 		return result, fmt.Errorf("monitor: %w", err)

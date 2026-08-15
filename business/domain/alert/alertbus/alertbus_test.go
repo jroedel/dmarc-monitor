@@ -2,6 +2,7 @@ package alertbus_test
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"strings"
@@ -119,7 +120,7 @@ func TestBodyCarriesEvidenceAndAction(t *testing.T) {
 		}
 	}
 
-	for _, line := range strings.Split(msg.Body, "\n") {
+	for line := range strings.SplitSeq(msg.Body, "\n") {
 		if len([]rune(line)) > 80 {
 			t.Errorf("line longer than 80 columns: %q", line)
 		}
@@ -136,7 +137,7 @@ func TestRefusesEmptyAlert(t *testing.T) {
 func TestSendDelivers(t *testing.T) {
 	sender := &capturingSender{}
 
-	if err := newBusiness(sender).Send(t.Context(), criticalAlert()); err != nil {
+	if _, err := newBusiness(sender).Send(t.Context(), criticalAlert()); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 
@@ -160,7 +161,7 @@ func TestNoticeIsPrefixedAndDelivered(t *testing.T) {
 		Body:    "dmarc-monitor updated itself.\n\n  from v1.1.0\n  to   v1.2.0\n",
 	}
 
-	if err := business.Notify(t.Context(), notice); err != nil {
+	if _, err := business.Notify(t.Context(), notice); err != nil {
 		t.Fatalf("Notify: %v", err)
 	}
 
@@ -189,7 +190,7 @@ func TestNoticeSubjectCannotBeInjected(t *testing.T) {
 		Body:    "x",
 	}
 
-	if err := newBusiness(sender).Notify(t.Context(), notice); err != nil {
+	if _, err := newBusiness(sender).Notify(t.Context(), notice); err != nil {
 		t.Fatalf("Notify: %v", err)
 	}
 
@@ -202,4 +203,69 @@ func TestNoticeWithoutSubjectIsRefused(t *testing.T) {
 	if _, err := newBusiness(&capturingSender{}).RenderNotice(alertbus.Notice{Body: "x"}); err == nil {
 		t.Error("rendered a notice with no subject")
 	}
+}
+
+// The Message-ID is the only handle on a message once it has left, so it has to
+// be on every message and it has to come back to the caller. A send that is
+// logged without one cannot be traced into a mail server's log afterwards.
+func TestSentMessagesCarryAnID(t *testing.T) {
+	sender := &capturingSender{}
+
+	msg, err := newBusiness(sender).Send(t.Context(), criticalAlert())
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	switch {
+	case msg.ID.IsZero():
+		t.Fatal("Send returned a message with no id")
+	case sender.sent[0].ID != msg.ID:
+		t.Errorf("the id sent (%s) is not the id returned (%s)", sender.sent[0].ID, msg.ID)
+	case !strings.HasSuffix(msg.ID.String(), "@example.com>"):
+		t.Errorf("id = %s, want it to borrow the from address's domain", msg.ID)
+	}
+}
+
+// Two messages sharing an id is not a cosmetic problem: a receiver is entitled
+// to treat the second as a duplicate it has already seen and drop it, which
+// would silently discard the alert that mattered.
+func TestEveryRenderMintsANewID(t *testing.T) {
+	business := newBusiness(&capturingSender{})
+	seen := make(map[string]bool)
+
+	for range 100 {
+		msg, err := business.Render(criticalAlert())
+		if err != nil {
+			t.Fatalf("Render: %v", err)
+		}
+
+		if seen[msg.ID.String()] {
+			t.Fatalf("Message-ID %s was minted twice", msg.ID)
+		}
+
+		seen[msg.ID.String()] = true
+	}
+}
+
+// A failed send must still name the message it failed to send — that is the
+// case where an operator most needs the id, because nothing downstream logged
+// it for them.
+func TestFailedSendNamesTheMessage(t *testing.T) {
+	_, err := newBusiness(&failingSender{}).Notify(t.Context(), alertbus.Notice{
+		Subject: "test",
+		Body:    "x",
+	})
+	if err == nil {
+		t.Fatal("a failing sender produced no error")
+	}
+
+	if !strings.Contains(err.Error(), "@example.com>") {
+		t.Errorf("error does not carry the Message-ID: %v", err)
+	}
+}
+
+type failingSender struct{}
+
+func (failingSender) Send(context.Context, alertbus.Message) error {
+	return errors.New("relay said no")
 }

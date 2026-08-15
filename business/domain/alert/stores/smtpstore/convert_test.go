@@ -16,6 +16,7 @@ import (
 
 func testMessage() alertbus.Message {
 	return alertbus.Message{
+		ID:      email.MustParseMessageID("<deadbeef.1700000000@example.com>"),
 		From:    email.MustParse("dmarc@example.com"),
 		To:      []email.Email{email.MustParse("webmaster@example.com")},
 		Subject: "CRITICAL: example.com — mail from 198.51.100.7 is being blocked",
@@ -74,23 +75,32 @@ func TestHeaders(t *testing.T) {
 	}
 }
 
-// Two messages must never share a Message-ID; a receiver is entitled to treat
-// the second as a duplicate and drop it.
-func TestMessageIDsAreUnique(t *testing.T) {
-	seen := make(map[string]bool)
+// The id is minted in the Business layer and carried in on the Message, so this
+// layer's job is to write the one it was given and nothing else. Uniqueness is
+// tested where the minting happens, in business/types/email.
+func TestMessageIDIsTheOneItWasGiven(t *testing.T) {
+	msg := testMessage()
 
-	for range 100 {
-		wire, err := toSMTPMessage(testMessage())
-		if err != nil {
-			t.Fatalf("toSMTPMessage: %v", err)
-		}
+	wire, err := toSMTPMessage(msg)
+	if err != nil {
+		t.Fatalf("toSMTPMessage: %v", err)
+	}
 
-		id := parse(t, wire).Header.Get("Message-ID")
-		if seen[id] {
-			t.Fatalf("Message-ID %q was generated twice", id)
-		}
+	if got, want := parse(t, wire).Header.Get("Message-ID"), msg.ID.String(); got != want {
+		t.Errorf("Message-ID = %q, want %q", got, want)
+	}
+}
 
-		seen[id] = true
+// A message with no id must not go out. Minting one here as a convenience would
+// defeat the point of minting it earlier: the id in the header would be one
+// nothing had logged, and the sent mail would be untraceable in exactly the
+// situation the id exists for.
+func TestMessageWithNoIDIsRefused(t *testing.T) {
+	msg := testMessage()
+	msg.ID = email.MessageID{}
+
+	if _, err := toSMTPMessage(msg); err == nil {
+		t.Error("a message with no id was rendered for sending")
 	}
 }
 

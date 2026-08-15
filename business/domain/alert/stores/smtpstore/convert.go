@@ -1,7 +1,6 @@
 package smtpstore
 
 import (
-	"crypto/rand"
 	"encoding/base64"
 	"fmt"
 	"mime"
@@ -24,16 +23,17 @@ func toSMTPMessage(msg alertbus.Message) ([]byte, error) {
 		return nil, fmt.Errorf("smtpstore: message has no from address")
 	case len(msg.To) == 0:
 		return nil, fmt.Errorf("smtpstore: message has no recipients")
+	case msg.ID.IsZero():
+		// Refused rather than minted here. The id is the Business layer's to
+		// make, because it has to be known and logged before this point is
+		// reached — including on the runs where this point is never reached at
+		// all.
+		return nil, fmt.Errorf("smtpstore: message has no id; it is minted when the message is rendered")
 	}
 
 	to := make([]string, 0, len(msg.To))
 	for _, addr := range msg.To {
 		to = append(to, addr.String())
-	}
-
-	messageID, err := messageID(msg.From.Domain())
-	if err != nil {
-		return nil, err
 	}
 
 	var b strings.Builder
@@ -49,7 +49,7 @@ func toSMTPMessage(msg alertbus.Message) ([]byte, error) {
 	header("To", strings.Join(to, ", "))
 	header("Subject", mime.QEncoding.Encode("utf-8", sanitize(msg.Subject)))
 	header("Date", time.Now().Format(time.RFC1123Z))
-	header("Message-ID", messageID)
+	header("Message-ID", msg.ID.String())
 	header("MIME-Version", "1.0")
 	header("Content-Type", `text/plain; charset="utf-8"`)
 	header("Content-Transfer-Encoding", "base64")
@@ -88,23 +88,6 @@ func encodeBase64(body string) string {
 	b.WriteString("\r\n")
 
 	return b.String()
-}
-
-// messageID builds a globally unique id. The random half is crypto/rand rather
-// than math/rand so that two hosts running this program cannot collide, and
-// because a predictable Message-ID is a small gift to anyone trying to thread a
-// forged reply into the webmaster's mailbox.
-func messageID(domain string) (string, error) {
-	var buf [16]byte
-	if _, err := rand.Read(buf[:]); err != nil {
-		return "", fmt.Errorf("smtpstore: generating message id: %w", err)
-	}
-
-	if domain == "" {
-		domain = "dmarc-monitor.invalid"
-	}
-
-	return fmt.Sprintf("<%x.%d@%s>", buf, time.Now().Unix(), domain), nil
 }
 
 // sanitize strips CR and LF from a header value. The subject is assembled from

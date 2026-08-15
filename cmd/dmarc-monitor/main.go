@@ -84,6 +84,7 @@ type flags struct {
 	cron        bool
 	noUpdate    bool
 	showVersion bool
+	testAlert   bool
 }
 
 func run() error {
@@ -92,7 +93,8 @@ func run() error {
 	flag.StringVar(&f.credentials, "credentials", "", "path to the credentials file (default: credentials.env beside the binary)")
 	flag.StringVar(&f.state, "state", "", "path to the state file (default: state.json beside the binary)")
 	flag.BoolVar(&f.initCreds, "init-credentials", false, "write a commented credentials template and exit")
-	flag.BoolVar(&f.check, "check", false, "verify the credentials parse and both servers are reachable, then exit")
+	flag.BoolVar(&f.check, "check", false, "verify the credentials parse and both servers are reachable, then exit; sends nothing")
+	flag.BoolVar(&f.testAlert, "test-alert", false, "send a real test message to the alert recipients and print its Message-ID, then exit")
 	flag.BoolVar(&f.once, "once", true, "run one cycle and exit")
 	flag.BoolVar(&f.watch, "watch", false, "poll on the configured interval until interrupted")
 	flag.BoolVar(&f.dryRun, "dry-run", false, "print the alert that would be sent; send nothing, change nothing")
@@ -193,8 +195,28 @@ func run() error {
 		Security: string(cfg.SMTPSecurity),
 	})
 
-	if f.check {
-		return check(ctx, log, cfg, reportStore, alertStore)
+	alerts := alertbus.NewBusiness(log, alertStore, alertbus.Config{
+		From:          cfg.AlertFrom,
+		To:            cfg.AlertTo,
+		SubjectPrefix: cfg.AlertSubjectPrefix,
+	})
+
+	// Both are diagnostics that exit instead of running a cycle, and they
+	// compose. -check proves the relay accepts a connection and a password;
+	// -test-alert proves a message survives the rest of the trip to a human.
+	// Running them together answers both questions in the order they fail in.
+	if f.check || f.testAlert {
+		if f.check {
+			if err := check(ctx, log, cfg, reportStore, alertStore); err != nil {
+				return err
+			}
+		}
+
+		if !f.testAlert {
+			return nil
+		}
+
+		return testAlert(ctx, alerts, f.dryRun)
 	}
 
 	state, err := checkpoint.Open(statePath)
@@ -212,12 +234,6 @@ func run() error {
 
 		log.Info("using local model for alert narratives", "endpoint", cfg.LLMEndpoint, "model", cfg.LLMModel)
 	}
-
-	alerts := alertbus.NewBusiness(log, alertStore, alertbus.Config{
-		From:          cfg.AlertFrom,
-		To:            cfg.AlertTo,
-		SubjectPrefix: cfg.AlertSubjectPrefix,
-	})
 
 	// Sent before the cycle, not after: this mail is proof that a new build
 	// reached the machine, and it should arrive even if the cycle that follows
@@ -328,14 +344,86 @@ func notify(ctx context.Context, log *slog.Logger, alerts *alertbus.Business, up
 			return
 		}
 
-		fmt.Printf("DRY RUN — the update notice that would be sent:\n\nTo:      %s\nSubject: %s\n\n%s\n",
-			joinAddresses(msg), msg.Subject, msg.Body)
+		fmt.Printf("DRY RUN — the update notice that would be sent:\n\nTo:         %s\nMessage-ID: %s\nSubject:    %s\n\n%s\n",
+			joinAddresses(msg), msg.ID, msg.Subject, msg.Body)
 
 		return
 	}
 
-	if err := alerts.Notify(ctx, notice); err != nil {
+	if _, err := alerts.Notify(ctx, notice); err != nil {
 		log.Warn("could not send the update notice; the update itself was fine", "err", err)
+	}
+}
+
+// testAlert sends the message this program exists to send, on demand.
+//
+// -check already proves the relay is reachable and the password is accepted.
+// That is a smaller claim than it looks: a relay can authenticate happily and
+// still have the receiving side drop the result into a spam folder, and a
+// monitor whose mail is being filtered is indistinguishable from a monitor with
+// nothing to report. The only way to tell them apart is to send something and
+// go looking for it.
+//
+// So this is not a simulation. It goes through the same rendering, the same
+// headers, the same encoding and the same relay as a real alert, and prints the
+// Message-ID afterwards — because the next question after "did it arrive?" is
+// always "then where did it go?", and that is the string a mail log is searched
+// by.
+func testAlert(ctx context.Context, alerts *alertbus.Business, dryRun bool) error {
+	notice := testNotice()
+
+	if dryRun {
+		msg, err := alerts.RenderNotice(notice)
+		if err != nil {
+			return err
+		}
+
+		fmt.Printf("DRY RUN — the test message that would be sent:\n\nTo:         %s\nMessage-ID: %s\nSubject:    %s\n\n%s\n",
+			joinAddresses(msg), msg.ID, msg.Subject, msg.Body)
+
+		return nil
+	}
+
+	msg, err := alerts.Notify(ctx, notice)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println("Test message sent.")
+	fmt.Printf("  Message-ID  %s\n", msg.ID)
+	fmt.Printf("  to          %s\n", joinAddresses(msg))
+	fmt.Println()
+	fmt.Println("The relay accepted it. If it does not arrive, that Message-ID is what to")
+	fmt.Println("search the mail server's log for — and check the spam folder first.")
+
+	return nil
+}
+
+// testNotice is the body of that message.
+//
+// It says plainly that a person asked for it, because the recipient is the
+// webmaster and every other mail this program sends means something needs
+// doing. An unexplained test message from a monitoring tool is indistinguishable
+// from the monitoring tool malfunctioning.
+func testNotice() alertbus.Notice {
+	host, err := os.Hostname()
+	if err != nil {
+		host = "an unknown host"
+	}
+
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "This is a test message from dmarc-monitor on %s.\n\n", host)
+	fmt.Fprintf(&b, "  version  %s\n", version)
+	fmt.Fprintf(&b, "  sent     %s\n", time.Now().Format(time.RFC1123Z))
+	b.WriteString("\nSomebody ran 'dmarc-monitor -test-alert' by hand. Nothing is wrong, no\n")
+	b.WriteString("DMARC report prompted this, and there is nothing to do about it.\n\n")
+	b.WriteString("It was rendered and sent exactly the way a real alert is — same headers,\n")
+	b.WriteString("same encoding, same relay — so if this reached you, a real alert will too.\n")
+
+	return alertbus.Notice{
+		Subject: fmt.Sprintf("test message from %s", host),
+		Body:    b.String(),
 	}
 }
 
@@ -522,15 +610,12 @@ func printSummary(s triagebus.Summary) {
 }
 
 func joinAddresses(msg alertbus.Message) string {
-	out := ""
-	for i, to := range msg.To {
-		if i > 0 {
-			out += ", "
-		}
-		out += to.String()
+	out := make([]string, 0, len(msg.To))
+	for _, to := range msg.To {
+		out = append(out, to.String())
 	}
 
-	return out
+	return strings.Join(out, ", ")
 }
 
 // resolve takes an explicit path or falls back to the package default.
