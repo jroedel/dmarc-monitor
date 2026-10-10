@@ -187,6 +187,10 @@ prod-dry-run: ## Run one cycle on the server and print the alert. Sends and chan
 prod-test-alert: ## Send ONE REAL test message from the server, and print its Message-ID
 	@deploy/deploy.sh test-alert
 
+.PHONY: prod-reports
+prod-reports: ## Raw reports received SINCE..UNTIL into local/reports/ (SINCE=2026-10-04 UNTIL=...). Read-only
+	@deploy/deploy.sh reports $(SINCE) $(UNTIL)
+
 .PHONY: prod-rollback
 prod-rollback: ## Put the previous binary back (run again to roll forward)
 	@deploy/deploy.sh rollback

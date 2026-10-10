@@ -84,7 +84,30 @@ func TestPolicyDefaults(t *testing.T) {
 // the identical report from all three, or a whole receiver's reports go missing
 // depending on which container they chose.
 func TestUnpackContainers(t *testing.T) {
-	raw := fixture(t)
+	tests := containers(t, fixture(t))
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			reports, err := dmarcxml.Unpack(tt.filename, tt.data)
+			if err != nil {
+				t.Fatalf("Unpack: %v", err)
+			}
+			if len(reports) != 1 {
+				t.Fatalf("got %d reports, want 1", len(reports))
+			}
+			if got, want := reports[0].ReportMetadata.ReportID, "18446744073709551615"; got != want {
+				t.Errorf("report id = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// containers wraps one document in every container a reporter might choose.
+func containers(t *testing.T, raw []byte) map[string]struct {
+	filename string
+	data     []byte
+} {
+	t.Helper()
 
 	var gzipped bytes.Buffer
 	zw := gzip.NewWriter(&gzipped)
@@ -104,7 +127,7 @@ func TestUnpackContainers(t *testing.T) {
 	}
 	zipw.Close()
 
-	tests := map[string]struct {
+	return map[string]struct {
 		filename string
 		data     []byte
 	}{
@@ -114,18 +137,24 @@ func TestUnpackContainers(t *testing.T) {
 		"mislabelled":  {"report.xml", gzipped.Bytes()},
 		"no extension": {"report", zipped.Bytes()},
 	}
+}
 
-	for name, tt := range tests {
+// Extract is what an export hands a person to read, so it must be the
+// reporter's document byte for byte, not this program's re-encoding of it.
+func TestExtractKeepsTheReportersBytes(t *testing.T) {
+	raw := fixture(t)
+
+	for name, tt := range containers(t, raw) {
 		t.Run(name, func(t *testing.T) {
-			reports, err := dmarcxml.Unpack(tt.filename, tt.data)
+			docs, err := dmarcxml.Extract(tt.filename, tt.data)
 			if err != nil {
-				t.Fatalf("Unpack: %v", err)
+				t.Fatalf("Extract: %v", err)
 			}
-			if len(reports) != 1 {
-				t.Fatalf("got %d reports, want 1", len(reports))
+			if len(docs) != 1 {
+				t.Fatalf("got %d documents, want 1", len(docs))
 			}
-			if got, want := reports[0].ReportMetadata.ReportID, "18446744073709551615"; got != want {
-				t.Errorf("report id = %q, want %q", got, want)
+			if !bytes.Equal(docs[0].XML, raw) {
+				t.Error("extracted XML differs from the document that was wrapped")
 			}
 		})
 	}
