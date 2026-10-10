@@ -82,6 +82,20 @@ else
 	pass "a missing required key is refused"
 fi
 
+grep -v '^SMTP_' "$TMP/secrets.env" > "$TMP/norelay.env"
+if SECRETS_ENV="$TMP/norelay.env" "$SECRETS" render production > "$TMP/norelay.out" 2>&1; then
+	pass "no relay credentials renders, for a relay on the server itself"
+else
+	fail "no relay credentials was refused: $(cat "$TMP/norelay.out")"
+fi
+
+grep -v '^SMTP_PASSWORD=' "$TMP/secrets.env" > "$TMP/halfrelay.env"
+if SECRETS_ENV="$TMP/halfrelay.env" "$SECRETS" render production > /dev/null 2>&1; then
+	fail "a relay username without its password was written"
+else
+	pass "a relay username without its password is refused, as the binary would"
+fi
+
 echo "local"
 export XDG_DATA_HOME="$TMP/xdg"
 mkdir -p "$XDG_DATA_HOME/dmarc-monitor"
