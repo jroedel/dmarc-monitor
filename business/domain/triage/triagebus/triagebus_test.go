@@ -511,3 +511,96 @@ func TestFailureEvidenceListsTheCommonPatterns(t *testing.T) {
 			"2 had no SPF result and DKIM pass for b.example, selector k1 (not aligned); "+
 			"1 had other results.")
 }
+
+// The action is the line a webmaster acts on. When the failing mail tells one
+// story, it must name the change that story calls for, not send the reader
+// back to the report to work it out.
+func TestActionNamesTheFixTheEvidenceCallsFor(t *testing.T) {
+	ours := domainname.MustParse("example.com")
+	other := domainname.MustParse("hosting.example")
+
+	tests := map[string]struct {
+		spf, dkim []triagebus.Check
+		want      string
+	}{
+		"return address at another domain, unsigned": {
+			spf:  []triagebus.Check{{Domain: other, Result: "pass"}},
+			want: "The failing mail uses a return address at hosting.example, so SPF passes for that domain and cannot count for example.com, and nothing signs it with DKIM. Give the sender a return address at example.com, or have it sign with a DKIM key published for example.com.",
+		},
+		"signature that does not verify": {
+			spf:  []triagebus.Check{{Domain: other, Result: "pass"}},
+			dkim: []triagebus.Check{{Domain: ours, Selector: "s2024", Result: "fail"}},
+			want: "The failing mail carries a DKIM signature for example.com that does not verify (fail). Check that s2024._domainkey.example.com is published and holds the key the sender signs with.",
+		},
+		"broken SPF record": {
+			spf:  []triagebus.Check{{Domain: ours, Result: "permerror"}},
+			want: "The SPF record for example.com returns permerror. Look for more than ten DNS lookups, or an include that no longer resolves.",
+		},
+		"signed by the service, not the domain": {
+			spf:  []triagebus.Check{{Domain: other, Result: "pass"}},
+			dkim: []triagebus.Check{{Domain: other, Selector: "k1", Result: "pass"}},
+			want: "The failing mail is signed with a DKIM key for hosting.example, which does not count for example.com. Set the sender up to sign as example.com, by publishing the DKIM record it provides under example.com.",
+		},
+		"server missing from SPF": {
+			spf:  []triagebus.Check{{Domain: ours, Result: "softfail"}},
+			want: "The failing mail gets SPF softfail for example.com and carries no DKIM signature. Add the sending server to the SPF record for example.com, or sign its mail with a DKIM key published for example.com.",
+		},
+		"nothing to go on": {
+			want: "Add 198.51.100.7 to the SPF record, or sign its mail with a DKIM key published for example.com.",
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			v := assess(t, []triagebus.Observation{
+				observation("198.51.100.7", 100),
+				observation("198.51.100.7", 60, failing, func(o *triagebus.Observation) {
+					o.SPFChecked = tt.spf
+					o.DKIMChecked = tt.dkim
+				}),
+			})
+
+			f := finding(t, v, "failing-known-source")
+			mustContain(t, "action", f.Action, "Fix this before example.com moves to quarantine or reject.", tt.want)
+		})
+	}
+}
+
+// Advice drawn from one pattern is wrong for mail failing several ways at
+// once, so below half the generic advice stands; at a majority, it says so.
+func TestActionNeedsAMajorityPattern(t *testing.T) {
+	unsignedFrom := func(name string) obsOption {
+		return func(o *triagebus.Observation) {
+			failing(o)
+			o.SPFChecked = []triagebus.Check{{Domain: domainname.MustParse(name), Result: "pass"}}
+		}
+	}
+
+	split := assess(t, []triagebus.Observation{
+		observation("198.51.100.7", 100),
+		observation("198.51.100.7", 20, unsignedFrom("a.example")),
+		observation("198.51.100.7", 20, unsignedFrom("b.example")),
+		observation("198.51.100.7", 20, unsignedFrom("c.example")),
+	})
+	mustContain(t, "action", finding(t, split, "failing-known-source").Action, "Add 198.51.100.7 to the SPF record")
+
+	most := assess(t, []triagebus.Observation{
+		observation("198.51.100.7", 100),
+		observation("198.51.100.7", 40, unsignedFrom("a.example")),
+		observation("198.51.100.7", 20, unsignedFrom("b.example")),
+	})
+	mustContain(t, "action", finding(t, most, "failing-known-source").Action, "Most of the failing mail uses a return address at a.example")
+}
+
+// A blocked server's action keeps both halves: the fix if it is ours, and
+// what it means if it is not.
+func TestBlockedActionNamesTheFix(t *testing.T) {
+	v := assess(t, []triagebus.Observation{
+		observation("198.51.100.7", 31, enforcing),
+		observation("198.51.100.7", 7, unsigned, enforcing, quarantined),
+	})
+
+	mustContain(t, "action", finding(t, v, "blocked-known-source").Action,
+		"If 198.51.100.7 is one of ours: The failing mail uses a return address at hosting.example",
+		"If it is not ours, someone is sending as example.com and DMARC is correctly stopping them.")
+}
