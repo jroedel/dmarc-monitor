@@ -258,6 +258,13 @@ func run() error {
 	}
 
 	result, err := m.RunOnce(ctx)
+
+	// Only under -cron, for the same reason as the deploy notice: a person
+	// running a cycle by hand sees its error on their own terminal.
+	if f.cron {
+		trackHealth(ctx, log, alerts, state, err, f.dryRun)
+	}
+
 	if err != nil {
 		return err
 	}
@@ -303,25 +310,107 @@ func announceDeploy(ctx context.Context, log *slog.Logger, alerts *alertbus.Busi
 		path = "the installed binary"
 	}
 
-	notice := deployNotice(deployed{from: previous, to: version, commit: commit}, path)
+	sendNotice(ctx, log, alerts, "deploy notice", deployNotice(deployed{from: previous, to: version, commit: commit}, path), dryRun)
+}
 
-	if dryRun {
-		msg, err := alerts.RenderNotice(notice)
-		if err != nil {
-			log.Warn("could not render the deploy notice", "err", err)
+// trackHealth tells the webmaster when scheduled cycles start failing, again
+// about once a day while they keep failing, and once when they recover.
+//
+// A monitor that has stopped reading its mailbox is silent, and silence is
+// what a monitor with nothing to report looks like too. cron's own failure
+// mail cannot be relied on to break that silence: the crontab is shared, and
+// where its MAILTO goes is not this program's to decide. So the program says
+// so itself, through the relay it already has. It cannot when the relay is
+// what broke; the failure is still recorded, and the next run tries again.
+//
+// The outage is written to state.json the moment it is noticed, because a
+// failed cycle never reaches the save at the end of a good one. Under -dry-run
+// the mail is printed and nothing is recorded. A cycle stopped by a signal is
+// neither a failure nor a recovery.
+func trackHealth(ctx context.Context, log *slog.Logger, alerts *alertbus.Business, state *checkpoint.Store, cycleErr error, dryRun bool) {
+	now := time.Now()
+
+	switch {
+	case errors.Is(cycleErr, context.Canceled):
+		return
+
+	case cycleErr != nil:
+		if !dryRun {
+			if err := state.RecordFailure(now); err != nil {
+				log.Warn("could not record the failed run", "err", err)
+			}
+		}
+
+		since := now
+		if o, failing := state.Failing(); failing {
+			since = o.Since
+		}
+
+		if !dryRun && !state.FailureMailDue(now) {
+			log.Info("still failing; the webmaster was told within the last day", "since", since)
 
 			return
 		}
 
-		fmt.Printf("DRY RUN — the deploy notice that would be sent:\n\nTo:         %s\nMessage-ID: %s\nSubject:    %s\n\n%s\n",
-			joinAddresses(msg), msg.ID, msg.Subject, msg.Body)
+		sent := sendNotice(ctx, log, alerts, "failure notice", failureNotice(cycleErr, since), dryRun)
+		if sent && !dryRun {
+			if err := state.MarkFailureMailed(now); err != nil {
+				log.Warn("could not record the failure mail; it may repeat at the next run", "err", err)
+			}
+		}
 
-		return
+	default:
+		o, failing := state.Failing()
+		if !failing {
+			return
+		}
+
+		if !dryRun {
+			if _, _, err := state.RecordRecovery(); err != nil {
+				log.Warn("could not record the recovery; the recovery mail may repeat", "err", err)
+			}
+		}
+
+		log.Info("running again after failed runs", "since", o.Since)
+
+		// Nobody was told it was broken -- every failure mail failed too --
+		// so a mail saying it is fixed would be the first anyone heard of it.
+		if o.Mailed.IsZero() {
+			return
+		}
+
+		sendNotice(ctx, log, alerts, "recovery notice", recoveryNotice(o, now), dryRun)
+	}
+}
+
+// sendNotice mails a notice, or prints it under -dry-run, and reports whether
+// it went (or would have).
+//
+// Failures are logged and swallowed. Every notice is about the program rather
+// than about a report, and none of them may stop a cycle or change its exit
+// status: that is what the reports and cron.log are for.
+func sendNotice(ctx context.Context, log *slog.Logger, alerts *alertbus.Business, what string, notice alertbus.Notice, dryRun bool) bool {
+	if dryRun {
+		msg, err := alerts.RenderNotice(notice)
+		if err != nil {
+			log.Warn("could not render the "+what, "err", err)
+
+			return false
+		}
+
+		fmt.Printf("DRY RUN — the %s that would be sent:\n\nTo:         %s\nMessage-ID: %s\nSubject:    %s\n\n%s\n",
+			what, joinAddresses(msg), msg.ID, msg.Subject, msg.Body)
+
+		return true
 	}
 
 	if _, err := alerts.Notify(ctx, notice); err != nil {
-		log.Warn("could not send the deploy notice; the deploy itself was fine", "err", err)
+		log.Warn("could not send the "+what, "err", err)
+
+		return false
 	}
+
+	return true
 }
 
 // testAlert sends the message this program exists to send, on demand.
@@ -375,10 +464,7 @@ func testAlert(ctx context.Context, alerts *alertbus.Business, dryRun bool) erro
 // doing. An unexplained test message from a monitoring tool is indistinguishable
 // from the monitoring tool malfunctioning.
 func testNotice() alertbus.Notice {
-	host, err := os.Hostname()
-	if err != nil {
-		host = "an unknown host"
-	}
+	host := hostname()
 
 	var b strings.Builder
 
@@ -409,10 +495,7 @@ type deployed struct {
 // machine, so it names the versions, the host and the file, and stops. Anyone
 // who wants more has the commit linked.
 func deployNotice(d deployed, path string) alertbus.Notice {
-	host, err := os.Hostname()
-	if err != nil {
-		host = "an unknown host"
-	}
+	host := hostname()
 
 	var b strings.Builder
 
@@ -433,6 +516,69 @@ func deployNotice(d deployed, path string) alertbus.Notice {
 		Subject: fmt.Sprintf("deployed %s on %s", d.to, host),
 		Body:    b.String(),
 	}
+}
+
+// failureNotice is the mail sent when scheduled runs fail.
+//
+// It leads with what the failure means rather than what it was, because the
+// reader's first question is "is my mail being watched?", and the answer is
+// no. The error follows, verbatim: it is the only diagnosis the program has.
+func failureNotice(cycleErr error, since time.Time) alertbus.Notice {
+	host := hostname()
+
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "dmarc-monitor's scheduled run on %s failed.\n\n", host)
+	b.WriteString("Until this is fixed, no DMARC report is being read, so nothing will be\n")
+	b.WriteString("alerted on. This mail repeats about once a day while it lasts, and one\n")
+	b.WriteString("more follows when a run succeeds again.\n\n")
+	fmt.Fprintf(&b, "  failing since  %s\n", since.Format(time.RFC1123Z))
+	fmt.Fprintf(&b, "  version        %s\n\n", version)
+	fmt.Fprintf(&b, "The error:\n\n%s\n\n", indent(cycleErr.Error()))
+	b.WriteString("To look into it, from the project's checkout:\n\n")
+	b.WriteString("  make prod-check   # are the mailbox and the relay reachable? sends nothing\n")
+	b.WriteString("  make prod-logs    # the recent runs\n")
+
+	return alertbus.Notice{
+		Subject: fmt.Sprintf("run failed on %s", host),
+		Body:    b.String(),
+	}
+}
+
+// recoveryNotice is the mail sent when a run succeeds after failure mail went
+// out. Without it, the last word on the subject would be "broken".
+func recoveryNotice(o checkpoint.Outage, now time.Time) alertbus.Notice {
+	host := hostname()
+
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "dmarc-monitor's scheduled run on %s succeeded again.\n\n", host)
+	fmt.Fprintf(&b, "  failing since  %s\n", o.Since.Format(time.RFC1123Z))
+	fmt.Fprintf(&b, "  running again  %s\n", now.Format(time.RFC1123Z))
+	fmt.Fprintf(&b, "  for            %s\n\n", now.Sub(o.Since).Round(time.Minute))
+	b.WriteString("Reports that arrived meanwhile were read by this run, and anything they\n")
+	b.WriteString("warranted has been alerted on in its own mail.\n")
+
+	return alertbus.Notice{
+		Subject: fmt.Sprintf("running again on %s", host),
+		Body:    b.String(),
+	}
+}
+
+// indent sets an error's text off from the prose around it, line by line,
+// since a joined error spans several.
+func indent(s string) string {
+	return "  " + strings.ReplaceAll(s, "\n", "\n  ")
+}
+
+// hostname names the machine in a notice, or says it could not.
+func hostname() string {
+	host, err := os.Hostname()
+	if err != nil {
+		return "an unknown host"
+	}
+
+	return host
 }
 
 // initCredentials writes the template, and says where, because the path is

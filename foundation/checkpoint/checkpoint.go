@@ -39,6 +39,12 @@ type State struct {
 	// deploy replaces the binary from outside, so the first run of a new build
 	// is the only moment anything on the server can notice that one landed.
 	RunningVersion string `json:"running_version,omitempty"`
+
+	// FailingSince is when the current run of failed scheduled cycles began;
+	// zero while cycles succeed. FailureMailedAt is when the webmaster was last
+	// told about it. Both are cleared by the first cycle that succeeds.
+	FailingSince    time.Time `json:"failing_since,omitzero"`
+	FailureMailedAt time.Time `json:"failure_mailed_at,omitzero"`
 }
 
 // Store is the state file.
@@ -119,6 +125,8 @@ func Open(path string) (*Store, error) {
 	}
 	s.state.LastRun = loaded.LastRun
 	s.state.RunningVersion = loaded.RunningVersion
+	s.state.FailingSince = loaded.FailingSince
+	s.state.FailureMailedAt = loaded.FailureMailedAt
 
 	return &s, nil
 }
@@ -196,6 +204,79 @@ func (s *Store) RecordVersion(version string) error {
 	s.state.RunningVersion = version
 
 	return s.write()
+}
+
+// failureRemail is how long after one failure mail the next is due while the
+// cycles keep failing.
+//
+// Twenty hours, not twenty-four. Scheduled runs are twelve hours apart, so the
+// intent is "every other run": about once a day. A threshold of exactly a day
+// would be missed by the run a day later whenever it started a fraction of a
+// second earlier than the one that mailed -- and on a daylight-saving day the
+// gap between same-hour runs is twenty-three hours -- quietly stretching the
+// reminder to a day and a half. Anything between twelve and twenty-three hours
+// gives every other run; twenty is the middle of that, with room either side.
+const failureRemail = 20 * time.Hour
+
+// Outage describes a run of failed cycles: when it began, and when the
+// webmaster was last mailed about it (zero if never).
+type Outage struct {
+	Since  time.Time
+	Mailed time.Time
+}
+
+// Failing returns the current outage, and whether there is one.
+func (s *Store) Failing() (Outage, bool) {
+	o := Outage{Since: s.state.FailingSince, Mailed: s.state.FailureMailedAt}
+
+	return o, !o.Since.IsZero()
+}
+
+// RecordFailure notes that a cycle failed at now, and writes the file at once:
+// a failed cycle never reaches Save. Only the first failure of an outage sets
+// its start.
+func (s *Store) RecordFailure(now time.Time) error {
+	if !s.state.FailingSince.IsZero() {
+		return nil
+	}
+
+	s.state.FailingSince = now
+
+	return s.write()
+}
+
+// FailureMailDue reports whether the webmaster should be told about the
+// current outage at now: never yet, or not for failureRemail.
+func (s *Store) FailureMailDue(now time.Time) bool {
+	if s.state.FailingSince.IsZero() {
+		return false
+	}
+
+	return s.state.FailureMailedAt.IsZero() || now.Sub(s.state.FailureMailedAt) >= failureRemail
+}
+
+// MarkFailureMailed records that the webmaster was told at now, and writes the
+// file at once. Called only after the mail went, so a relay that is down too
+// means the next failed run tries again rather than waiting a day.
+func (s *Store) MarkFailureMailed(now time.Time) error {
+	s.state.FailureMailedAt = now
+
+	return s.write()
+}
+
+// RecordRecovery ends the current outage, if there is one, and writes the
+// file at once. It returns the outage that ended, so the caller can say how
+// long it lasted -- and whether anybody was told about it in the first place.
+func (s *Store) RecordRecovery() (Outage, bool, error) {
+	o, failing := s.Failing()
+	if !failing {
+		return Outage{}, false, nil
+	}
+
+	s.state.FailingSince = time.Time{}
+	s.state.FailureMailedAt = time.Time{}
+
+	return o, true, s.write()
 }
 
 // Save prunes expired entries and writes the file.
