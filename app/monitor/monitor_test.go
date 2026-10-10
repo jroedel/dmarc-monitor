@@ -378,3 +378,50 @@ func TestDryRunChangesNothing(t *testing.T) {
 		t.Error("the previewed message is not the real one")
 	}
 }
+
+// The receiver's raw results have to survive the trip from the report to the
+// email, because they are the part of the alert that says what to fix. The
+// opening line is read first and must read as English at a count of one.
+func TestAlertQuotesWhatTheReceiverSaw(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.json")
+
+	learn := newHarness(t, statePath,
+		[]reportbus.Report{report("r0", "100", record("203.0.113.10", 500))},
+		defaultConfig())
+	if _, err := learn.monitor.RunOnce(t.Context()); err != nil {
+		t.Fatalf("learning run: %v", err)
+	}
+
+	unsigned := func(rec *reportbus.Record) {
+		blocked(rec)
+		rec.Disposition = disposition.Quarantine
+		rec.SPFAuth = []reportbus.SPFAuth{{Domain: domainname.MustParse("hosting.example"), Result: "pass"}}
+	}
+
+	h := newHarness(t, statePath,
+		[]reportbus.Report{report("r1", "101",
+			record("203.0.113.10", 400),
+			record("203.0.113.10", 1, unsigned),
+		)},
+		defaultConfig())
+
+	if _, err := h.monitor.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if len(h.sender.sent) != 1 {
+		t.Fatalf("sent %d alerts, want 1", len(h.sender.sent))
+	}
+
+	// The body is wrapped for a mail client; the words are what matter.
+	body := strings.Join(strings.Fields(h.sender.sent[0].Body), " ")
+
+	for _, want := range []string{
+		"1 DMARC report covering example.com was processed. It accounts for 401 messages, of which 400 passed DMARC (99.8%) and 1 was quarantined or rejected. 1 finding below needs attention.",
+		"1 message from 203.0.113.10 was quarantined",
+		"The one that failed had SPF pass for hosting.example (not aligned) and no DKIM signature.",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("alert does not say %q:\n%s", want, body)
+		}
+	}
+}
