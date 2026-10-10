@@ -1,39 +1,64 @@
-# The same gate `make test` runs locally.
+# The same gate `make test` runs locally, on every pull request and on main.
 #
-# Worth more here than in most repositories: servers install published releases
-# without anyone watching, so the tag that triggers a release should only ever
-# be cut on a commit this has already passed.
+# Worth more here than in most repositories: a merge to main deploys, and the
+# server runs what it is given as the user holding the mailbox password, so
+# this is the last automated look a change gets before it is live.
+#
+# Also weekly, on main, with nothing changed. govulncheck is the one check
+# whose answer moves without a commit: a vulnerability published on Tuesday
+# against a module we already ship is a red build on Monday, which emails
+# whoever last touched this file, instead of waiting for the next change.
 name: ci
 
 on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "17 6 * * 1"
 
 permissions:
   contents: read
 
 jobs:
-  test:
+  check:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      # Pinned by commit, with the version beside it; Dependabot moves both
+      # together (.github/dependabot.yml). A tag can be moved to point at
+      # other code; a commit cannot.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
+          # From go.mod, so the toolchain in CI is the one the module declares
+          # and there is no second place to bump.
           go-version-file: go.mod
-          check-latest: true
+          cache: true
 
-      - name: Lint
-        run: |
-          go vet ./...
-          test -z "$(gofmt -l .)" || { echo "gofmt needed:"; gofmt -l .; exit 1; }
+      - name: lint
+        run: make lint
 
-      - name: Test
-        run: go test -race ./...
+      - name: unit tests, with the race detector
+        run: make test-unit
+
+      - name: shell tests
+        run: make shell-test
+
+      # The runner image ships shellcheck. deploy.sh and scripts/secrets hold
+      # the deploy key and edit a crontab shared with other projects; a quoting
+      # mistake in either is not one to find on the server.
+      - name: shellcheck
+        run: make shellcheck
 
       # Fails the build on a known-vulnerable dependency or toolchain, which is
       # how the go.mod patch pin stays honest.
-      - name: Vulnerabilities
-        run: go tool govulncheck ./...
+      - name: vulnerability scan
+        run: make vuln-check
+
+      # Not a duplicate of `go build`. konsoleH has no Go toolchain and gets
+      # one file, so a build that quietly links this runner's libc is a deploy
+      # that dies on the host. release-build asserts the result is static.
+      - name: the release build is static
+        run: make release-build

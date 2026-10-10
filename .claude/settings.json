@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(make deploy*)",
+      "Bash(make prod-*)",
+      "Bash(make local-credentials*)",
+      "Bash(deploy/deploy.sh*)",
+      "Bash(./deploy/deploy.sh*)",
+      "Bash(bash deploy/deploy.sh*)",
+      "Bash(scripts/secrets *)",
+      "Bash(./scripts/secrets *)",
+      "Bash(bash scripts/secrets *)",
+      "Bash(ssh *)",
+      "Bash(scp *)",
+      "Bash(sftp *)",
+      "Bash(rsync *)",
+      "Bash(gh secret *)",
+      "Bash(gh variable *)",
+      "Bash(gh pr merge*)",
+      "Bash(gh workflow run*)",
+      "Bash(git push origin main*)",
+      "Bash(git push * main)",
+      "Bash(git push * HEAD:main*)",
+      "Read(./secrets.env)",
+      "Read(./secrets.env.bak)",
+      "Read(~/.local/share/dmarc-monitor/credentials.env*)"
+    ]
+  }
+}

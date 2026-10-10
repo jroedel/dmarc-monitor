@@ -31,6 +31,10 @@
   (`~/.local/share/dmarc-monitor/credentials.env`, or whatever `-credentials`
   points at). Not to "check the format", not to debug a parse error. Ask the
   user to redact and paste the one line in question.
+- **Never read `secrets.env`.** It holds the deploy key and the production
+  mailbox password, and is the source both credentials files are rendered
+  from. `secrets.env.example` is the committed template; edit that. A rendering
+  bug is debugged with `make shell-test` and fixtures, never the real file.
 - **Never connect to the live mailbox or the live SMTP relay.** No `openssl
   s_client`, no `curl imaps://`, no running the binary without `-dry-run`
   against real credentials. Every one of those authenticates as the user.
@@ -50,6 +54,10 @@ still never send a real alert without `-dry-run` unless the user asks for it in
 that turn. When the mailbox is swapped for the production one, this paragraph
 must be deleted.
 
+That file is written by `make local-credentials` from the `DEV_*` group of
+`secrets.env`. The production mailbox is the runtime group of the same file and
+reaches only the server; the exception never covers it.
+
 ## Alerting is outward-facing
 
 The whole point of this program is to send mail to a human. Treat any code path
@@ -59,6 +67,27 @@ that can send as production-adjacent:
   alert it *would* send; that is the only mode you run.
 - A change to the triage thresholds changes who gets woken up. Plan those with
   the user before writing them.
+
+## Deploying — a merge to main is a deploy
+
+`.github/workflows/deploy.yml` ships every push to main to the konsoleH account
+over ssh (`deploy/deploy.sh`). Dependabot bumps are merged and deployed by
+`.github/workflows/dependabot-merge.yml` after a day with CI green.
+
+- **The pull request is the human in the loop.** You open it; a person merges
+  it. Its description says what the change does to the running monitor — what
+  it will send, to whom, and when — not only what it does to the code.
+- **Never touch the server.** No `ssh`, `scp` or `rsync`, no `deploy/deploy.sh`,
+  no `scripts/secrets`, and none of the `make deploy*`, `make prod-*` or
+  `make local-credentials` targets. They exist for a person at a terminal. If a
+  task needs something from production (a `cron.log` line, what is installed),
+  say what and why, and give the user the target to run.
+- **Never set GitHub secrets or variables.** `DEPLOY_*` are secrets, `APP_*`
+  variables; the runtime group never goes to GitHub at all. The repository is
+  public, and so are its Actions logs: nothing a workflow runs may print what
+  the binary says about the mailbox.
+- `.claude/settings.json` denies these, so the rule holds when it is forgotten.
+  A denied command is the answer; do not work around it.
 
 ## Feature development — mandatory skills
 
