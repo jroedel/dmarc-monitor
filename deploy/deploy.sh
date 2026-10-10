@@ -56,8 +56,9 @@ load_config() {
 	DEPLOY_SSH_PORT="${DEPLOY_SSH_PORT:-22}"
 	KEEP_BACKUPS="${KEEP_BACKUPS:-14}"
 
-	[[ "$KEEP_BACKUPS" =~ ^[0-9]+$ ]] && [ "$KEEP_BACKUPS" -ge 1 ] \
-		|| die "KEEP_BACKUPS is \"$KEEP_BACKUPS\"; it must be a whole number of at least 1"
+	if ! [[ "$KEEP_BACKUPS" =~ ^[0-9]+$ ]] || [ "$KEEP_BACKUPS" -lt 1 ]; then
+		die "KEEP_BACKUPS is \"$KEEP_BACKUPS\"; it must be a whole number of at least 1"
+	fi
 
 	# credentials.env lives here. Inside any site's docroot, Apache would
 	# serve the mailbox password; and an absolute path or a .. is a deploy
@@ -121,9 +122,9 @@ ensure_main() {
 	local branch; branch="$(git -C "$REPO_DIR" rev-parse --abbrev-ref HEAD)"
 	[ "$branch" = "main" ] || die "on branch $branch; deploys come from main. Set DEPLOY_ALLOW_BRANCH=1 to override"
 
-	# shellcheck disable=SC2015 # either diff failing is the same answer: dirty
-	git -C "$REPO_DIR" diff --quiet && git -C "$REPO_DIR" diff --cached --quiet \
-		|| die "the working tree has uncommitted changes; what would be deployed is not what is committed"
+	if ! git -C "$REPO_DIR" diff --quiet || ! git -C "$REPO_DIR" diff --cached --quiet; then
+		die "the working tree has uncommitted changes; what would be deployed is not what is committed"
+	fi
 }
 
 # superseded reports whether main has moved past the commit being deployed.
@@ -142,7 +143,7 @@ superseded() {
 	mine="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null)" || return 1
 	tip="$(git -C "$REPO_DIR" ls-remote origin refs/heads/main 2>/dev/null | cut -f1)" || return 1
 
-	[ -n "$mine" ] && [ -n "$tip" ] || return 1
+	if [ -z "$mine" ] || [ -z "$tip" ]; then return 1; fi
 	[ "$mine" != "$tip" ]
 }
 
