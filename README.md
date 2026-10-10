@@ -28,7 +28,9 @@ still gets through immediately.
 
 Every finding about failing mail quotes what the receiver saw on it — which
 domain SPF was checked against, and which DKIM signature, if any — since that,
-not the word "failed", is what says what to fix.
+not the word "failed", is what says what to fix. When at least half of the
+failing mail fails the same way, the action names the change: a return address
+at the domain, a DKIM record that does not match its key, a broken SPF record.
 
 Deliberately silent: failures the receiver itself excused (`forwarded`,
 `trusted_forwarder`, `mailing_list`). `sampled_out` is not an excuse: it means

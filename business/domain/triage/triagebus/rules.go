@@ -85,10 +85,9 @@ func (b *Business) blockedKnownSources(domain domainname.DomainName, sources []s
 			Volume:   s.blocked,
 			Headline: headline,
 			Detail:   s.blockedDetail(domain),
-			Action: fmt.Sprintf(
-				"Check what %s is: if it is one of ours, its SPF entry or DKIM key has probably changed or expired. "+
-					"If it is not ours, someone is sending as %s and DMARC is correctly stopping them.",
-				s.ip, domain),
+			Action: sentences(
+				ifOurs(s.ip, domain, s.evidence, "its SPF entry or DKIM key has probably changed or expired."),
+				fmt.Sprintf("If it is not ours, someone is sending as %s and DMARC is correctly stopping them.", domain)),
 		})
 	}
 
@@ -150,15 +149,16 @@ func (b *Business) failingKnownSources(domain domainname.DomainName, sources []s
 		// enforcing policy nothing was blocked only because pct= sampled every
 		// failure out, and the next sample will not be so kind.
 		delivered := fmt.Sprintf("The published policy is p=%s, so the mail was still delivered — for now.", s.policy)
-		action := fmt.Sprintf(
-			"Fix this before %s moves to quarantine or reject: add %s to the SPF record, or sign its mail with a DKIM key published for %s.",
-			domain, s.ip, domain)
+		when := fmt.Sprintf("Fix this before %s moves to quarantine or reject.", domain)
 
 		if s.policy != disposition.None {
 			delivered = fmt.Sprintf("The published policy is p=%s, and the mail was delivered only because the policy's pct= sampling skipped it this time.", s.policy)
-			action = fmt.Sprintf(
-				"Fix this before a receiver blocks it: add %s to the SPF record, or sign its mail with a DKIM key published for %s.",
-				s.ip, domain)
+			when = "Fix this before a receiver blocks it."
+		}
+
+		fix, ok := remedy(domain, s.evidence)
+		if !ok {
+			fix = fmt.Sprintf("Add %s to the SPF record, or sign its mail with a DKIM key published for %s.", s.ip, domain)
 		}
 
 		findings = append(findings, Finding{
@@ -173,7 +173,7 @@ func (b *Business) failingKnownSources(domain domainname.DomainName, sources []s
 					failing, count(s.volume, "message", "messages"), percent(failing, s.volume), s.ip, s.orgList()),
 				s.evidence.describe(),
 				delivered),
-			Action: action,
+			Action: sentences(when, fix),
 		})
 	}
 
@@ -202,6 +202,7 @@ func (b *Business) newSources(domain domainname.DomainName, sources []sourceStat
 		}
 
 		level := severity.Notice
+		fix := "If it is, add it to SPF or DKIM."
 		detail := fmt.Sprintf(
 			"%s sent %s as %s and %s authenticated correctly. It has not appeared in any earlier report.",
 			s.ip, count(s.volume, "message", "messages"), domain, allOf(s.volume))
@@ -212,6 +213,10 @@ func (b *Business) newSources(domain domainname.DomainName, sources []sourceStat
 				fmt.Sprintf("%s sent %s as %s, of which %d failed DMARC. It has not appeared in any earlier report.",
 					s.ip, count(s.volume, "message", "messages"), domain, s.failing()),
 				s.evidence.describe())
+
+			if specific, ok := remedy(domain, s.evidence); ok {
+				fix = "If it is: " + specific
+			}
 		}
 
 		findings = append(findings, Finding{
@@ -222,9 +227,10 @@ func (b *Business) newSources(domain domainname.DomainName, sources []sourceStat
 			Volume:   s.volume,
 			Headline: fmt.Sprintf("New sender %s for %s", s.ip, domain),
 			Detail:   detail,
-			Action: fmt.Sprintf(
-				"Confirm %s is a service that should be sending as %s. If it is, add it to SPF or DKIM. If it is not, it is being spoofed.",
-				s.ip, domain),
+			Action: sentences(
+				fmt.Sprintf("Confirm %s is a service that should be sending as %s.", s.ip, domain),
+				fix,
+				"If it is not, it is being spoofed."),
 		})
 	}
 
@@ -289,17 +295,20 @@ func (b *Business) domainWideFailure(domain domainname.DomainName, t totals, sou
 
 	// One sender is not a domain-wide pattern, whatever kept it from being
 	// named: too little mail to judge on its own, or the first report ever.
-	action := fmt.Sprintf(
-		"Check the current SPF and DKIM records for %s — an include that stopped resolving, or a selector that no longer exists, produces exactly this pattern.",
-		domain)
+	action, ok := remedy(domain, seen)
+	if !ok {
+		action = fmt.Sprintf(
+			"Check the current SPF and DKIM records for %s — an include that stopped resolving, or a selector that no longer exists, produces exactly this pattern.",
+			domain)
+	}
 
 	if senders == 1 {
 		detail = fmt.Sprintf(
 			"%d of %s failed DMARC and %d %s blocked, all of them from %s, which sent too little to be judged on its own or has no history yet.",
 			failing, count(t.volume, "message", "messages"), blocked, were(blocked), sender)
-		action = fmt.Sprintf(
-			"Check what %s is: if it is one of ours, add it to the SPF record or sign its mail with a DKIM key published for %s. If it is not ours, someone is sending as %s.",
-			sender, domain, domain)
+		action = sentences(
+			ifOurs(sender, domain, seen, fmt.Sprintf("add it to the SPF record or sign its mail with a DKIM key published for %s.", domain)),
+			fmt.Sprintf("If it is not ours, someone is sending as %s.", domain))
 	}
 
 	if len(explained) > 0 {
@@ -413,14 +422,60 @@ func listOrgs(orgs []string) string {
 // them, which is the first thing anyone investigating needs and the last thing
 // a raw report makes obvious. Keyed by the description itself, so that rows
 // from different reports with the same story add up.
-type evidence map[string]int
+type evidence map[string]*pattern
 
-func (e evidence) add(o Observation) { e[checkedAs(o)] += o.Count }
+// pattern is one combination of raw results, with the checks that make it up
+// kept alongside the words, because remedy reasons about the checks.
+type pattern struct {
+	text string
+	n    int
+	spf  []Check
+	dkim []Check
+}
+
+func (e evidence) add(o Observation) {
+	text := checkedAs(o)
+
+	p, ok := e[text]
+	if !ok {
+		p = &pattern{text: text, spf: o.SPFChecked, dkim: o.DKIMChecked}
+		e[text] = p
+	}
+
+	p.n += o.Count
+}
 
 func (e evidence) merge(other evidence) {
-	for text, n := range other {
-		e[text] += n
+	for text, p := range other {
+		mine, ok := e[text]
+		if !ok {
+			mine = &pattern{text: p.text, spf: p.spf, dkim: p.dkim}
+			e[text] = mine
+		}
+
+		mine.n += p.n
 	}
+}
+
+// sorted is the patterns most common first, ties broken by text so that two
+// runs over the same data say the same thing.
+func (e evidence) sorted() []*pattern {
+	return slices.SortedFunc(maps.Values(e), func(a, b *pattern) int {
+		if c := cmp.Compare(b.n, a.n); c != 0 {
+			return c
+		}
+
+		return strings.Compare(a.text, b.text)
+	})
+}
+
+func (e evidence) total() int {
+	total := 0
+	for _, p := range e {
+		total += p.n
+	}
+
+	return total
 }
 
 // describe says what the failing messages had in common, most common first.
@@ -432,31 +487,21 @@ func (e evidence) describe() string {
 		return ""
 	}
 
-	total := 0
-	for _, n := range e {
-		total += n
-	}
-
-	patterns := slices.SortedFunc(maps.Keys(e), func(a, b string) int {
-		if c := cmp.Compare(e[b], e[a]); c != 0 {
-			return c
-		}
-
-		return strings.Compare(a, b)
-	})
+	total := e.total()
+	patterns := e.sorted()
 
 	switch {
 	case len(patterns) == 1 && total == 1:
-		return fmt.Sprintf("The one that failed had %s.", patterns[0])
+		return fmt.Sprintf("The one that failed had %s.", patterns[0].text)
 	case len(patterns) == 1:
-		return fmt.Sprintf("All %d that failed had %s.", total, patterns[0])
+		return fmt.Sprintf("All %d that failed had %s.", total, patterns[0].text)
 	}
 
 	parts := make([]string, 0, shown+1)
 	rest := total
 	for _, p := range patterns[:min(shown, len(patterns))] {
-		parts = append(parts, fmt.Sprintf("%d had %s", e[p], p))
-		rest -= e[p]
+		parts = append(parts, fmt.Sprintf("%d had %s", p.n, p.text))
+		rest -= p.n
 	}
 
 	if rest > 0 {
