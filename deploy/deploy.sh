@@ -339,6 +339,47 @@ cmd_check()      { load_config; ssh_setup; remote_in_app "./$APP -check"; }
 cmd_dry_run()    { load_config; ssh_setup; remote_in_app "./$APP -once -dry-run"; }
 cmd_test_alert() { load_config; ssh_setup; remote_in_app "./$APP -test-alert"; }
 
+# cmd_reports brings the aggregate reports received from SINCE through UNTIL
+# (default: today) to this machine, under local/reports/. They are what an
+# alert summarised: which mechanism failed, for which domain, under which DKIM
+# selector -- the thing to look at before changing a DNS record.
+#
+# The binary reads the mailbox read-only and writes a tar to stdout; nothing is
+# written on the server and no message changes. It includes reports already
+# handled, so the one behind yesterday's alert is there.
+#
+# They are production data: who sends as these domains, from where, and how
+# much. local/ is gitignored. Do not copy them into testdata/; the repository
+# is public.
+cmd_reports() {
+	local since="${1:-}" until="${2:-}"
+	local date_re='^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+
+	# Checked here as well as by the binary, because they are about to be part
+	# of a command line run on the server.
+	[[ "$since" =~ $date_re ]] || die "usage: make prod-reports SINCE=YYYY-MM-DD [UNTIL=YYYY-MM-DD]"
+	[ -z "$until" ] || [[ "$until" =~ $date_re ]] || die "UNTIL ($until) is not a date like 2026-10-09"
+
+	load_config
+	ssh_setup
+	require tar
+
+	local dest="$REPO_DIR/local/reports/$since${until:+_$until}"
+	mkdir -p "$dest"
+	chmod 700 "$REPO_DIR/local/reports" "$dest"
+
+	local args="-since $since"
+	[ -z "$until" ] || args="$args -until $until"
+
+	# The binary names every file from an allowlist of characters, so no
+	# report can choose a path; --no-same-owner keeps tar from trying anyway.
+	if ! remote_in_app "./$APP -export-reports $args" | tar -x --no-same-owner -C "$dest"; then
+		die "the export did not finish; what arrived is in $dest and may be incomplete"
+	fi
+
+	ok "$(find "$dest" -maxdepth 1 -name '*.xml' | wc -l | tr -d ' ') report(s) in ${dest#"$REPO_DIR"/}"
+}
+
 usage() {
 	cat <<-USAGE
 		usage: deploy/deploy.sh <command>
@@ -350,6 +391,8 @@ usage() {
 		  check         run -check on the server: both ends reachable; sends nothing
 		  dry-run       run one cycle on the server, print the alert; sends and changes nothing
 		  test-alert    send one real test message from the server
+		  reports SINCE [UNTIL]
+		                fetch the raw reports received SINCE..UNTIL into local/reports/; read-only
 		  cron-rewrite  filter a crontab on stdin as a deploy would (for tests)
 	USAGE
 }
@@ -362,6 +405,7 @@ logs)         shift; cmd_logs "$@" ;;
 check)        shift; cmd_check "$@" ;;
 dry-run)      shift; cmd_dry_run "$@" ;;
 test-alert)   shift; cmd_test_alert "$@" ;;
+reports)      shift; cmd_reports "$@" ;;
 cron-rewrite) shift; Q_DIR="$(printf '%q' "${APP_DIR:?APP_DIR is not set}")"; cron_rewrite ;;
 *)            usage; exit 2 ;;
 esac

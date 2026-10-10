@@ -11,6 +11,8 @@
 //	dmarc-monitor -once               run a full cycle for real
 //	dmarc-monitor -cron               what the crontab runs: lock, one cycle, deploy notice
 //	dmarc-monitor -watch              poll forever
+//	dmarc-monitor -export-reports -since 2026-10-04 | tar -x
+//	                                  hand over the reports themselves, read-only
 package main
 
 import (
@@ -87,6 +89,9 @@ type flags struct {
 	cron        bool
 	showVersion bool
 	testAlert   bool
+	export      bool
+	since       string
+	until       string
 }
 
 func run() error {
@@ -102,6 +107,9 @@ func run() error {
 	flag.BoolVar(&f.dryRun, "dry-run", false, "print the alert that would be sent; send nothing, change nothing")
 	flag.BoolVar(&f.includeSeen, "include-seen", false, "examine every message, not only unread ones (for a first run over an existing archive)")
 	flag.BoolVar(&f.cron, "cron", false, "what a crontab entry runs: take the lock, run one cycle, exit; mails once when a new build is deployed")
+	flag.BoolVar(&f.export, "export-reports", false, "write the reports for -since through -until to stdout as a tar archive, then exit; read-only. Searches by arrival date, one day past -until")
+	flag.StringVar(&f.since, "since", "", "with -export-reports: the first day wanted, YYYY-MM-DD")
+	flag.StringVar(&f.until, "until", "", "with -export-reports: the last day wanted, YYYY-MM-DD (default: today, UTC)")
 	flag.BoolVar(&f.showVersion, "version", false, "print the version and exit")
 	flag.BoolVar(&f.debug, "debug", false, "log at debug level")
 	flag.StringVar(&f.logFormat, "log", "text", "log format: text or json")
@@ -176,6 +184,21 @@ func run() error {
 		IncludeSeen: f.includeSeen,
 		DryRun:      f.dryRun,
 	})
+
+	// Before anything that could send or record: an export reads the mailbox
+	// and nothing else.
+	if f.export {
+		from, before, err := exportWindow(f.since, f.until, time.Now())
+		if err != nil {
+			return err
+		}
+
+		if err := refuseTerminal(os.Stdout); err != nil {
+			return err
+		}
+
+		return exportReports(ctx, log, reportStore, from, before, os.Stdout)
+	}
 
 	alertStore := smtpstore.NewStore(log, smtpstore.Config{
 		Host:     cfg.SMTPHost,

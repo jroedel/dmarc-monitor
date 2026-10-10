@@ -158,6 +158,8 @@ make prod-logs N=200        # the tail of cron.log
 make prod-check             # mailbox and relay reachable? sends nothing
 make prod-dry-run           # one cycle, the alert printed; sends and changes nothing
 make prod-test-alert        # ONE REAL test message, and its Message-ID
+make prod-reports SINCE=2026-10-04 UNTIL=2026-10-09
+                            # the raw reports behind an alert, into local/reports/; read-only
 make prod-rollback          # the previous binary back (again to roll forward)
 make deploy                 # deploy from here; the ordinary path is a merge
 ```
@@ -165,6 +167,14 @@ make deploy                 # deploy from here; the ordinary path is a merge
 `-test-alert` is worth running once after the first deploy: a relay that
 authenticates is not the same as a mailbox that receives, and a filtered alert
 looks exactly like a quiet month.
+
+`prod-reports` is the step after an alert. The alert says what happened; the
+report's `<auth_results>` say why — which SPF domain was checked, which DKIM
+domain and selector, and what each returned. Dates are the days the reports
+cover: a receiver sends a day's report the day after, so the search reaches
+one day past `UNTIL`, and may also bring the report for the day before
+`SINCE`. Reports already handled are included. The files are production data;
+`local/` is gitignored, and they do not belong in `testdata/`.
 
 ### One directory holds the installation
 

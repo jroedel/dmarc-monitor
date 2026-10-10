@@ -17,35 +17,61 @@ import (
 // anyone on the internet can send to.
 const maxUncompressed = 64 << 20
 
-// Unpack decodes one report attachment, whatever it is wrapped in, and returns
-// every aggregate report inside it.
+// Document is one aggregate report's XML exactly as the reporter wrote it,
+// taken out of whatever container it arrived in. Name is the zip entry's name,
+// or the attachment's own filename for raw XML and gzip; it is the reporter's
+// choice and must not be trusted as a path.
+type Document struct {
+	Name string
+	XML  []byte
+}
+
+// Extract takes one report attachment out of its container without parsing it.
 //
 // Reporters use three containers: raw XML, gzip, and zip — the last of which
 // may in principle hold several reports, though in practice holds one. The
 // filename is a hint only; content sniffing decides, because filenames arrive
 // mangled (".xml.gz" served as ".gz", ".zip" as ".xml"), and a wrong guess here
 // would silently drop a report.
-func Unpack(filename string, data []byte) ([]Feedback, error) {
+func Extract(filename string, data []byte) ([]Document, error) {
+	name := path.Base(filename)
+
 	switch {
 	case isZip(data):
-		return unpackZip(data)
+		return extractZip(data)
 
 	case isGzip(data):
-		fb, err := unpackGzip(data)
+		xmlData, err := gunzip(data)
 		if err != nil {
 			return nil, err
 		}
 
-		return []Feedback{fb}, nil
+		return []Document{{Name: strings.TrimSuffix(name, ".gz"), XML: xmlData}}, nil
 
 	default:
-		fb, err := Parse(bytes.NewReader(data))
+		return []Document{{Name: name, XML: data}}, nil
+	}
+}
+
+// Unpack decodes one report attachment, whatever it is wrapped in, and returns
+// every aggregate report inside it.
+func Unpack(filename string, data []byte) ([]Feedback, error) {
+	docs, err := Extract(filename, data)
+	if err != nil {
+		return nil, err
+	}
+
+	reports := make([]Feedback, 0, len(docs))
+	for _, doc := range docs {
+		fb, err := Parse(bytes.NewReader(doc.XML))
 		if err != nil {
-			return nil, fmt.Errorf("attachment %q: %w", path.Base(filename), err)
+			return nil, fmt.Errorf("attachment %q: %w", doc.Name, err)
 		}
 
-		return []Feedback{fb}, nil
+		reports = append(reports, fb)
 	}
+
+	return reports, nil
 }
 
 // IsReportAttachment reports whether a MIME part looks like it carries an
@@ -82,66 +108,61 @@ func isGzip(data []byte) bool {
 	return len(data) >= 2 && data[0] == 0x1f && data[1] == 0x8b
 }
 
-func unpackGzip(data []byte) (Feedback, error) {
+func gunzip(data []byte) ([]byte, error) {
 	zr, err := gzip.NewReader(bytes.NewReader(data))
 	if err != nil {
-		return Feedback{}, fmt.Errorf("opening gzip attachment: %w", err)
+		return nil, fmt.Errorf("opening gzip attachment: %w", err)
 	}
 	defer zr.Close()
 
 	xmlData, err := readCapped(zr)
 	if err != nil {
-		return Feedback{}, fmt.Errorf("reading gzip attachment: %w", err)
+		return nil, fmt.Errorf("reading gzip attachment: %w", err)
 	}
 
-	return Parse(bytes.NewReader(xmlData))
+	return xmlData, nil
 }
 
-func unpackZip(data []byte) ([]Feedback, error) {
+func extractZip(data []byte) ([]Document, error) {
 	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		return nil, fmt.Errorf("opening zip attachment: %w", err)
 	}
 
-	var reports []Feedback
+	var docs []Document
 	for _, f := range zr.File {
 		if f.FileInfo().IsDir() || !strings.HasSuffix(strings.ToLower(f.Name), ".xml") {
 			continue
 		}
 
-		fb, err := readZipEntry(f)
+		xmlData, err := readZipEntry(f)
 		if err != nil {
 			return nil, err
 		}
 
-		reports = append(reports, fb)
+		docs = append(docs, Document{Name: path.Base(f.Name), XML: xmlData})
 	}
 
-	if len(reports) == 0 {
+	if len(docs) == 0 {
 		return nil, fmt.Errorf("zip attachment contains no .xml entry")
 	}
 
-	return reports, nil
+	return docs, nil
 }
 
-func readZipEntry(f *zip.File) (Feedback, error) {
+func readZipEntry(f *zip.File) ([]byte, error) {
 	rc, err := f.Open()
 	if err != nil {
-		return Feedback{}, fmt.Errorf("opening zip entry %q: %w", f.Name, err)
+		return nil, fmt.Errorf("opening zip entry %q: %w", f.Name, err)
 	}
 	defer rc.Close()
 
 	xmlData, err := readCapped(rc)
 	if err != nil {
-		return Feedback{}, fmt.Errorf("reading zip entry %q: %w", f.Name, err)
+		return nil, fmt.Errorf("reading zip entry %q: %w", f.Name, err)
 	}
 
-	fb, err := Parse(bytes.NewReader(xmlData))
-	if err != nil {
-		return Feedback{}, fmt.Errorf("zip entry %q: %w", f.Name, err)
-	}
-
-	return fb, nil
+	return xmlData, nil
 }
 
 // readCapped reads at most maxUncompressed bytes and reports an error if there
