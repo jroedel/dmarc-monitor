@@ -142,9 +142,9 @@ ALERT_TO=
 
 #ALERT_COOLDOWN=72h
 
-# Mail the same recipients when the program installs a new version of itself.
-# Rare -- only when a release actually lands -- and it is how an unattended
-# deployment is verified: proof the pipeline reached the server, without
+# Mail the same recipients on the first scheduled run of a newly deployed
+# build. Rare -- only when a deploy actually lands -- and it is how a deploy is
+# verified from the server's side: proof the pipeline reached it, without
 # logging in to check. Set to false once that stops being interesting.
 
 #ALERT_ON_UPDATE=true
