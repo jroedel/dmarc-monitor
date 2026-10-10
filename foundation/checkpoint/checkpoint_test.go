@@ -67,3 +67,88 @@ func TestRecordVersionLeavesLastRun(t *testing.T) {
 		t.Errorf("LastRun = %v, want %v", reopened.LastRun(), ran)
 	}
 }
+
+// An outage, run by run, as the twice-daily schedule produces it: mailed at
+// the first failure, quiet at the next, mailed again a day on -- including
+// when the run a day on starts a moment earlier than the one that mailed --
+// and closed by the first success. Every step reopens the file, because a
+// failed cycle never calls Save and the outage must survive on its own.
+func TestOutage(t *testing.T) {
+	path := filepath.Join(t.TempDir(), Name)
+	start := time.Date(2026, 10, 10, 13, 0, 1, 0, time.UTC)
+
+	open := func() *Store {
+		t.Helper()
+
+		s, err := Open(path)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+
+		return s
+	}
+
+	fail := func(at time.Time, wantDue bool) {
+		t.Helper()
+
+		s := open()
+		if err := s.RecordFailure(at); err != nil {
+			t.Fatalf("RecordFailure: %v", err)
+		}
+
+		if got := s.FailureMailDue(at); got != wantDue {
+			t.Fatalf("at %v: FailureMailDue = %v, want %v", at, got, wantDue)
+		}
+
+		if wantDue {
+			if err := s.MarkFailureMailed(at); err != nil {
+				t.Fatalf("MarkFailureMailed: %v", err)
+			}
+		}
+	}
+
+	fail(start, true)
+	fail(start.Add(12*time.Hour), false)
+	fail(start.Add(24*time.Hour-time.Second), true)
+	fail(start.Add(36*time.Hour), false)
+
+	if o, failing := open().Failing(); !failing || !o.Since.Equal(start) {
+		t.Fatalf("Failing = %v, %v; want an outage since %v", o, failing, start)
+	}
+
+	o, ended, err := open().RecordRecovery()
+	switch {
+	case err != nil:
+		t.Fatalf("RecordRecovery: %v", err)
+	case !ended:
+		t.Fatal("RecordRecovery found no outage")
+	case !o.Since.Equal(start), o.Mailed.IsZero():
+		t.Fatalf("outage = %+v; want since %v, mailed", o, start)
+	}
+
+	if _, failing := open().Failing(); failing {
+		t.Fatal("still failing after recovery")
+	}
+
+	if _, ended, _ := open().RecordRecovery(); ended {
+		t.Fatal("a second recovery reported an outage")
+	}
+}
+
+// A failure whose mail could not be sent -- the relay is down too -- must be
+// retried at the next failed run, not a day later.
+func TestUnmailedFailureStaysDue(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), Name))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	start := time.Date(2026, 10, 10, 13, 0, 0, 0, time.UTC)
+	if err := s.RecordFailure(start); err != nil {
+		t.Fatalf("RecordFailure: %v", err)
+	}
+
+	if !s.FailureMailDue(start.Add(12 * time.Hour)) {
+		t.Error("an outage nobody was told about is not due at the next run")
+	}
+}

@@ -115,6 +115,17 @@ the deploy reached the machine, from the machine's own side; it is sent once,
 before the cycle, so it arrives even if that cycle then fails.
 `ALERT_ON_UPDATE=false` in `secrets.env` turns it off.
 
+### When it breaks, it says so
+
+A monitor that has stopped reading its mailbox is silent, and so is one with
+nothing to report. So when a scheduled run fails — a changed password, a
+mailbox that will not open — the program mails **`[dmarc] run failed on
+<host>`** with the error, through its own relay: at the first failed run, then
+about once a day while it lasts, then **`[dmarc] running again on <host>`** at
+the first run that succeeds. It does not rely on cron's `MAILTO`, which the
+shared crontab leaves pointing at the account itself. It cannot mail when the
+relay is what broke; it records the failure and tries again next run.
+
 Nothing about the mailbox is ever in GitHub. The repository and its Actions
 logs are public, so CI holds only the ssh deploy key; the mailbox and relay
 passwords reach the server from a person's machine.
