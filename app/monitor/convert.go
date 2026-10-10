@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -50,6 +51,8 @@ func toTriageObservations(reports []reportbus.Report, memory sourceMemory) []tri
 				HeaderFrom:      rec.HeaderFrom,
 				Aligned:         rec.Aligned(r.Policy),
 				Overrides:       overrides,
+				SPFChecked:      toTriageSPFChecks(rec.SPFAuth),
+				DKIMChecked:     toTriageDKIMChecks(rec.DKIMAuth),
 				KnownSource:     memory.KnownSource(r.Domain.String(), rec.SourceIP.String()),
 				FirstEverReport: firstEver,
 			})
@@ -57,6 +60,27 @@ func toTriageObservations(reports []reportbus.Report, memory sourceMemory) []tri
 	}
 
 	return obs
+}
+
+// toTriageSPFChecks and toTriageDKIMChecks carry the raw results across as
+// evidence. The selector travels because it is the one detail that tells a
+// removed DKIM record from a signature that never happened.
+func toTriageSPFChecks(auths []reportbus.SPFAuth) []triagebus.Check {
+	checks := make([]triagebus.Check, 0, len(auths))
+	for _, a := range auths {
+		checks = append(checks, triagebus.Check{Domain: a.Domain, Result: a.Result})
+	}
+
+	return checks
+}
+
+func toTriageDKIMChecks(auths []reportbus.DKIMAuth) []triagebus.Check {
+	checks := make([]triagebus.Check, 0, len(auths))
+	for _, a := range auths {
+		checks = append(checks, triagebus.Check{Domain: a.Domain, Selector: a.Selector, Result: a.Result})
+	}
+
+	return checks
 }
 
 // sourceMemory is the slice of the checkpoint that triage input needs. Declared
@@ -107,23 +131,51 @@ func preamble(v triagebus.Verdict) string {
 
 	var b strings.Builder
 
-	fmt.Fprintf(&b, "%d DMARC report(s) covering %s were processed.",
-		s.Reports, joinDomains(s))
+	fmt.Fprintf(&b, "%s covering %s %s processed.",
+		count(s.Reports, "DMARC report", "DMARC reports"), joinDomains(s), were(s.Reports))
 
 	if s.Volume > 0 {
-		fmt.Fprintf(&b, " They account for %d message(s), of which %d passed DMARC (%.1f%%)",
-			s.Volume, s.Passing, 100*s.PassRate())
+		subject := "They account"
+		if s.Reports == 1 {
+			subject = "It accounts"
+		}
+
+		fmt.Fprintf(&b, " %s for %s, of which %d passed DMARC (%.1f%%)",
+			subject, count(s.Volume, "message", "messages"), s.Passing, 100*s.PassRate())
 
 		if s.Blocked > 0 {
-			fmt.Fprintf(&b, " and %d were quarantined or rejected", s.Blocked)
+			fmt.Fprintf(&b, " and %d %s quarantined or rejected", s.Blocked, were(s.Blocked))
 		}
 
 		b.WriteString(".")
 	}
 
-	fmt.Fprintf(&b, " %d finding(s) below need attention.", len(v.Findings))
+	needs := "need"
+	if len(v.Findings) == 1 {
+		needs = "needs"
+	}
+
+	fmt.Fprintf(&b, " %s below %s attention.", count(len(v.Findings), "finding", "findings"), needs)
 
 	return b.String()
+}
+
+// count is n with the noun that agrees with it: "1 message", "7 messages".
+func count(n int, one, many string) string {
+	if n == 1 {
+		return "1 " + one
+	}
+
+	return strconv.Itoa(n) + " " + many
+}
+
+// were is the verb that agrees with n.
+func were(n int) string {
+	if n == 1 {
+		return "was"
+	}
+
+	return "were"
 }
 
 // footer is the arithmetic, at the bottom, where someone who wants to check the

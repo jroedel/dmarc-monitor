@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/netip"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -309,4 +310,204 @@ func TestSummaryArithmetic(t *testing.T) {
 	if got, want := s.PassRate(), 0.8; got != want {
 		t.Errorf("pass rate = %v, want %v", got, want)
 	}
+}
+
+// unsigned is mail that SPF-passed for a different domain and carried no DKIM
+// signature: what a web application sends when it uses its own hosting
+// account's address as the envelope sender and nothing signs for the domain.
+func unsigned(o *triagebus.Observation) {
+	failing(o)
+	o.SPFChecked = []triagebus.Check{{Domain: domainname.MustParse("hosting.example"), Result: "pass"}}
+}
+
+func quarantined(o *triagebus.Observation) { o.Disposition = disposition.Quarantine }
+
+func sampledOut(o *triagebus.Observation) { o.Overrides = []string{"sampled_out"} }
+
+func finding(t *testing.T, v triagebus.Verdict, code string) triagebus.Finding {
+	t.Helper()
+
+	i := slices.IndexFunc(v.Findings, func(f triagebus.Finding) bool { return f.Code == code })
+	if i < 0 {
+		t.Fatalf("no %s finding; got %v", code, codes(v))
+	}
+
+	return v.Findings[i]
+}
+
+func mustContain(t *testing.T, field, got string, wants ...string) {
+	t.Helper()
+
+	for _, want := range wants {
+		if !strings.Contains(got, want) {
+			t.Errorf("%s does not say %q:\n%s", field, want, got)
+		}
+	}
+}
+
+// A receiver that skipped the policy because pct= told it to has not
+// explained anything: at pct=100 the same messages are blocked. A known
+// server whose failing mail all happened to be sampled out must not go quiet.
+func TestSampledOutFailuresAreNotExcused(t *testing.T) {
+	v := assess(t, []triagebus.Observation{
+		observation("198.51.100.7", 60, unsigned, enforcing, sampledOut),
+	})
+
+	f := finding(t, v, "failing-known-source")
+	if f.Severity != severity.Warning {
+		t.Errorf("severity = %s, want warning", f.Severity)
+	}
+
+	// The domain is already enforcing, so "before it moves to quarantine"
+	// would be advice about a step already taken.
+	mustContain(t, "detail", f.Detail, "delivered only because the policy's pct= sampling skipped it this time")
+	if strings.Contains(f.Action, "moves to quarantine") {
+		t.Errorf("action assumes p=none on an enforcing domain: %s", f.Action)
+	}
+}
+
+// Every receiver that saw a server reports it; only some of them blocked it.
+// Naming the wrong one sends the webmaster to the wrong postmaster page.
+func TestBlockedNamesTheReceiverThatBlocked(t *testing.T) {
+	v := assess(t, []triagebus.Observation{
+		observation("198.51.100.7", 100, enforcing, func(o *triagebus.Observation) { o.Org = "Outlook.com" }),
+		observation("198.51.100.7", 100, enforcing),
+		observation("198.51.100.7", 10, unsigned, enforcing, quarantined),
+	})
+
+	f := finding(t, v, "blocked-known-source")
+	mustContain(t, "detail", f.Detail, "and google.com quarantined 10 of them.")
+}
+
+// One sender that is not named — first report ever, or too little mail to
+// judge — is not a domain-wide pattern, and must not be described as one.
+func TestDomainWideFailureFromOneUnnamedSender(t *testing.T) {
+	v := assess(t, []triagebus.Observation{
+		observation("198.51.100.7", 19, enforcing, unknownSource),
+		observation("198.51.100.7", 7, unsigned, enforcing, sampledOut, unknownSource),
+	})
+
+	f := finding(t, v, "domain-failure-rate")
+	mustContain(t, "detail", f.Detail, "7 of 26 messages failed DMARC and 0 were blocked, all of them from 198.51.100.7")
+	if strings.Contains(f.Detail, "record is wrong") {
+		t.Errorf("one sender described as a domain-wide record problem:\n%s", f.Detail)
+	}
+}
+
+// The shape of a real day: one server sends most of its mail correctly and a
+// small stream unsigned, under p=quarantine with pct=25, so the receiver
+// quarantines a quarter of the stream and delivers the rest by sampling. The
+// alert must say how much failed, how much got through only by luck, and what
+// the receiver saw — and say it once, not again as a domain-wide finding that
+// claims no sender is responsible.
+func TestBlockedSourceExplainsItself(t *testing.T) {
+	v := assess(t, []triagebus.Observation{
+		observation("198.51.100.7", 31, enforcing),
+		observation("198.51.100.7", 2, unsigned, enforcing, quarantined),
+		observation("198.51.100.7", 5, unsigned, enforcing, sampledOut),
+		observation("203.0.113.41", 6, enforcing),
+	})
+
+	if got := codes(v); !slices.Equal(got, []string{"blocked-known-source"}) {
+		t.Fatalf("findings = %v, want only blocked-known-source", got)
+	}
+
+	f := v.Findings[0]
+	if f.Severity != severity.Critical {
+		t.Errorf("severity = %s, want critical: 7 of 38 failing is well over the threshold", f.Severity)
+	}
+
+	mustContain(t, "headline", f.Headline, "Mail from 198.51.100.7 is being blocked")
+	mustContain(t, "detail", f.Detail,
+		"7 of its 38 messages in this reporting window failed DMARC, and google.com quarantined 2 of them.",
+		"Another 5 were delivered only because the policy's pct= sampling skipped them",
+		"All 7 that failed had SPF pass for hosting.example (not aligned) and no DKIM signature.")
+}
+
+// Severity follows how much of a server's mail fails, so one quarantined
+// message among a thousand clean ones is still reported, but as what it is.
+func TestOneBlockedMessageAmongManyIsAWarning(t *testing.T) {
+	v := assess(t, []triagebus.Observation{
+		observation("198.51.100.7", 1000, enforcing),
+		observation("198.51.100.7", 1, unsigned, enforcing, quarantined),
+	})
+
+	f := finding(t, v, "blocked-known-source")
+	if f.Severity != severity.Warning {
+		t.Errorf("severity = %s, want warning", f.Severity)
+	}
+
+	mustContain(t, "headline", f.Headline, "1 message from 198.51.100.7 was quarantined")
+	mustContain(t, "detail", f.Detail, "The one that failed had SPF pass for hosting.example (not aligned) and no DKIM signature.")
+}
+
+// With no sender bad enough to name, the domain-wide finding is the only
+// signal, and the receiver's results are what point at the record to check.
+func TestDomainWideFailureWithoutANamedSender(t *testing.T) {
+	var obs []triagebus.Observation
+	for i := range 6 {
+		ip := netip.AddrFrom4([4]byte{192, 0, 2, byte(10 + i)}).String()
+		obs = append(obs,
+			observation(ip, 20, enforcing),
+			observation(ip, 3, enforcing, failing, func(o *triagebus.Observation) {
+				o.DKIMChecked = []triagebus.Check{{Domain: domainname.MustParse("example.com"), Selector: "s2024", Result: "fail"}}
+				o.SPFChecked = []triagebus.Check{{Domain: domainname.MustParse("example.com"), Result: "permerror"}}
+			}))
+	}
+
+	v := assess(t, obs)
+
+	f := finding(t, v, "domain-failure-rate")
+	mustContain(t, "detail", f.Detail,
+		"18 of 138 messages failed DMARC and 0 were blocked, spread across 6 senders, none failing enough to be named on its own.",
+		"All 18 that failed had SPF permerror for example.com and DKIM fail for example.com, selector s2024.")
+}
+
+// When a sender is already named, the domain-wide finding speaks only for
+// what is left, and only if what is left is itself over the threshold.
+func TestDomainWideFailureCountsOnlyWhatIsUnexplained(t *testing.T) {
+	obs := []triagebus.Observation{
+		observation("198.51.100.7", 100, enforcing),
+		observation("198.51.100.7", 20, unsigned, enforcing, quarantined),
+	}
+	for i := range 5 {
+		ip := netip.AddrFrom4([4]byte{192, 0, 2, byte(10 + i)}).String()
+		obs = append(obs, observation(ip, 2, enforcing, failing))
+	}
+
+	v := assess(t, obs)
+
+	f := finding(t, v, "domain-failure-rate")
+	mustContain(t, "headline", f.Headline, "Another 7.7% of mail claiming example.com is failing DMARC")
+	mustContain(t, "detail", f.Detail,
+		"Apart from the senders above, 10 of the domain's 130 messages failed DMARC and 0 were blocked, from 5 other senders.")
+
+	if strings.Contains(f.Detail, "none failing enough") {
+		t.Errorf("detail claims no sender is named, after one was:\n%s", f.Detail)
+	}
+}
+
+// Several stories at once are told most common first, and the tail is
+// counted rather than dropped.
+func TestFailureEvidenceListsTheCommonPatterns(t *testing.T) {
+	other := func(name string) obsOption {
+		return func(o *triagebus.Observation) {
+			o.DKIMChecked = []triagebus.Check{{Domain: domainname.MustParse(name), Selector: "k1", Result: "pass"}}
+		}
+	}
+
+	v := assess(t, []triagebus.Observation{
+		observation("198.51.100.7", 100),
+		observation("198.51.100.7", 6, unsigned),
+		observation("198.51.100.7", 3, failing, other("a.example")),
+		observation("198.51.100.7", 2, failing, other("b.example")),
+		observation("198.51.100.7", 1, failing, other("c.example")),
+	})
+
+	f := finding(t, v, "failing-known-source")
+	mustContain(t, "detail", f.Detail,
+		"Of the 12 that failed, 6 had SPF pass for hosting.example (not aligned) and no DKIM signature; "+
+			"3 had no SPF result and DKIM pass for a.example, selector k1 (not aligned); "+
+			"2 had no SPF result and DKIM pass for b.example, selector k1 (not aligned); "+
+			"1 had other results.")
 }

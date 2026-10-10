@@ -57,9 +57,9 @@ release-build: ## Build the static linux/amd64 binary the server runs
 
 # ---------------------------------------------------------------- run locally
 #
-# These read the credentials in ~/.local/share/dmarc-monitor/, which is the
-# disposable test mailbox (AGENTS.md). make local-credentials writes that file
-# from the DEV_* group in secrets.env.
+# These read the credentials in ~/.local/share/dmarc-monitor/, which make
+# local-credentials writes from the DEV_* group in secrets.env. That account
+# receives the live reports (AGENTS.md): run and check connect to it.
 
 .PHONY: init-credentials
 init-credentials: ## Write a commented credentials template to ~/.local/share/dmarc-monitor

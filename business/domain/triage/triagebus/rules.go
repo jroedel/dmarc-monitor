@@ -1,10 +1,12 @@
 package triagebus
 
 import (
+	"cmp"
 	"fmt"
 	"maps"
 	"net/netip"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/jroedel/dmarc-monitor/business/types/disposition"
@@ -28,13 +30,15 @@ func (b *Business) assessDomain(obs []Observation) []Finding {
 	sources := groupBySource(obs)
 	totals := totalOf(obs)
 
-	var findings []Finding
+	// The per-source rules first, because the domain-wide rule is about what
+	// they leave unexplained.
+	findings := slices.Concat(
+		b.blockedKnownSources(domain, sources),
+		b.failingKnownSources(domain, sources),
+		b.newSources(domain, sources),
+	)
 
-	findings = append(findings, b.blockedKnownSources(domain, sources)...)
-	findings = append(findings, b.failingKnownSources(domain, sources)...)
-	findings = append(findings, b.newSources(domain, sources)...)
-
-	if f, ok := b.domainWideFailure(domain, totals, obs); ok {
+	if f, ok := b.domainWideFailure(domain, totals, sources, findings); ok {
 		findings = append(findings, f)
 	}
 
@@ -49,6 +53,13 @@ func (b *Business) assessDomain(obs []Observation) []Finding {
 // a server this domain has legitimately used before is now having its mail
 // quarantined or rejected. That is real mail not arriving, right now, and it is
 // almost always a key rotation, an IP change or an expired SPF include.
+//
+// It is graded on how much of the server's mail fails, not on how much was
+// blocked. Under pct= below 100 the receiver blocks only a sample of the
+// failures, so the blocked count understates the problem by the same factor;
+// what fails is what a pct=100 would block. A server failing below the
+// failure-rate threshold still gets the finding, as a warning, worded as the
+// handful of messages it is.
 func (b *Business) blockedKnownSources(domain domainname.DomainName, sources []sourceStats) []Finding {
 	var findings []Finding
 
@@ -58,17 +69,22 @@ func (b *Business) blockedKnownSources(domain domainname.DomainName, sources []s
 			continue
 		}
 
+		level := severity.Warning
+		headline := fmt.Sprintf("%s from %s %s %s", count(s.blocked, "message", "messages"), s.ip, were(s.blocked), s.blockedVerb())
+
+		if share(s.failing(), s.volume) >= b.thresholds.FailureRate {
+			level = severity.Critical
+			headline = fmt.Sprintf("Mail from %s is being blocked", s.ip)
+		}
+
 		findings = append(findings, Finding{
-			Severity: severity.Critical,
+			Severity: level,
 			Code:     "blocked-known-source",
 			Domain:   domain,
 			Subject:  s.ip.String(),
 			Volume:   s.blocked,
-			Headline: fmt.Sprintf("Mail from %s is being blocked", s.ip),
-			Detail: fmt.Sprintf(
-				"%s has sent mail for %s before, but %d of its %d messages in this reporting window were %s by %s. "+
-					"%s. This is mail that did not reach the recipient.",
-				s.ip, domain, s.blocked, s.volume, s.blockedVerb(), s.orgList(), s.authSummary()),
+			Headline: headline,
+			Detail:   s.blockedDetail(domain),
 			Action: fmt.Sprintf(
 				"Check what %s is: if it is one of ours, its SPF entry or DKIM key has probably changed or expired. "+
 					"If it is not ours, someone is sending as %s and DMARC is correctly stopping them.",
@@ -79,6 +95,35 @@ func (b *Business) blockedKnownSources(domain domainname.DomainName, sources []s
 	return findings
 }
 
+// blockedDetail is the evidence for a blocked source: how much failed, how
+// much of that the receiver blocked, how much got through only by sampling,
+// and what the receiver saw on the messages that failed.
+func (s sourceStats) blockedDetail(domain domainname.DomainName) string {
+	failing := s.failing()
+
+	// Default: the usual shape, where the blocked messages are among the
+	// failures. A receiver can also block mail that passed, on its own policy,
+	// and then the failures are not the story.
+	opening := fmt.Sprintf(
+		"%s has sent mail for %s before, but %d of its %s in this reporting window failed DMARC, and %s %s %d of them.",
+		s.ip, domain, failing, count(s.volume, "message", "messages"), listOrgs(s.blockers), s.blockedVerb(), s.blocked)
+	if failing < s.blocked {
+		opening = fmt.Sprintf(
+			"%s has sent mail for %s before, but %d of its %s in this reporting window %s %s by %s.",
+			s.ip, domain, s.blocked, count(s.volume, "message", "messages"), were(s.blocked), s.blockedVerb(), listOrgs(s.blockers))
+	}
+
+	var sampled string
+	switch {
+	case s.sampled == 1:
+		sampled = "One more was delivered only because the policy's pct= sampling skipped it; at pct=100 it would have been blocked too."
+	case s.sampled > 1:
+		sampled = fmt.Sprintf("Another %d were delivered only because the policy's pct= sampling skipped them; at pct=100 they would have been blocked too.", s.sampled)
+	}
+
+	return sentences(opening, sampled, s.evidence.describe())
+}
+
 // failingKnownSources catches the same problem one stage earlier: a known
 // sender failing authentication while the published policy still lets the mail
 // through. This is the window in which the fix costs nothing, which is exactly
@@ -87,18 +132,33 @@ func (b *Business) failingKnownSources(domain domainname.DomainName, sources []s
 	var findings []Finding
 
 	for _, s := range sources {
-		failing := s.volume - s.passing
+		failing := s.failing()
 
 		switch {
 		case !s.known, s.blocked > 0, failing == 0:
 			continue
 		case s.volume < b.thresholds.MinimumVolume:
 			continue
-		case float64(failing)/float64(s.volume) < b.thresholds.FailureRate:
+		case share(failing, s.volume) < b.thresholds.FailureRate:
 			continue
 		case s.excused == failing:
 			// Every failure was one the receiver told us to expect.
 			continue
+		}
+
+		// Default: p=none, where failing mail is delivered by design. Under an
+		// enforcing policy nothing was blocked only because pct= sampled every
+		// failure out, and the next sample will not be so kind.
+		delivered := fmt.Sprintf("The published policy is p=%s, so the mail was still delivered — for now.", s.policy)
+		action := fmt.Sprintf(
+			"Fix this before %s moves to quarantine or reject: add %s to the SPF record, or sign its mail with a DKIM key published for %s.",
+			domain, s.ip, domain)
+
+		if s.policy != disposition.None {
+			delivered = fmt.Sprintf("The published policy is p=%s, and the mail was delivered only because the policy's pct= sampling skipped it this time.", s.policy)
+			action = fmt.Sprintf(
+				"Fix this before a receiver blocks it: add %s to the SPF record, or sign its mail with a DKIM key published for %s.",
+				s.ip, domain)
 		}
 
 		findings = append(findings, Finding{
@@ -108,13 +168,12 @@ func (b *Business) failingKnownSources(domain domainname.DomainName, sources []s
 			Subject:  s.ip.String(),
 			Volume:   failing,
 			Headline: fmt.Sprintf("%s is failing authentication for %s", s.ip, domain),
-			Detail: fmt.Sprintf(
-				"%d of %d messages (%s) from %s failed DMARC, reported by %s. %s. "+
-					"The published policy is p=%s, so the mail was still delivered — for now.",
-				failing, s.volume, percent(failing, s.volume), s.ip, s.orgList(), s.authSummary(), s.policy),
-			Action: fmt.Sprintf(
-				"Fix this before %s moves to quarantine or reject: add %s to the SPF record, or sign its mail with a DKIM key published for %s.",
-				domain, s.ip, domain),
+			Detail: sentences(
+				fmt.Sprintf("%d of %s (%s) from %s failed DMARC, reported by %s.",
+					failing, count(s.volume, "message", "messages"), percent(failing, s.volume), s.ip, s.orgList()),
+				s.evidence.describe(),
+				delivered),
+			Action: action,
 		})
 	}
 
@@ -144,14 +203,15 @@ func (b *Business) newSources(domain domainname.DomainName, sources []sourceStat
 
 		level := severity.Notice
 		detail := fmt.Sprintf(
-			"%s sent %d messages as %s and they all authenticated correctly. It has not appeared in any earlier report.",
-			s.ip, s.volume, domain)
+			"%s sent %s as %s and %s authenticated correctly. It has not appeared in any earlier report.",
+			s.ip, count(s.volume, "message", "messages"), domain, allOf(s.volume))
 
 		if s.passing < s.volume {
 			level = severity.Warning
-			detail = fmt.Sprintf(
-				"%s sent %d messages as %s, of which %d failed DMARC. It has not appeared in any earlier report. %s.",
-				s.ip, s.volume, domain, s.volume-s.passing, s.authSummary())
+			detail = sentences(
+				fmt.Sprintf("%s sent %s as %s, of which %d failed DMARC. It has not appeared in any earlier report.",
+					s.ip, count(s.volume, "message", "messages"), domain, s.failing()),
+				s.evidence.describe())
 		}
 
 		findings = append(findings, Finding{
@@ -176,21 +236,77 @@ func (b *Business) newSources(domain domainname.DomainName, sources []sourceStat
 // failing more than it should. That shape is usually a policy or record
 // problem — a broken SPF include, a DKIM record removed — rather than one
 // misbehaving server.
-func (b *Business) domainWideFailure(domain domainname.DomainName, t totals, obs []Observation) (Finding, bool) {
-	failing := t.volume - t.passing
+//
+// It counts only the failures the findings before it leave unexplained. A
+// sender already named has its own finding; counting it again here produced an
+// alert that named a culprit and then said no single sender was responsible.
+// The rate is still taken over all of the domain's mail, because the question
+// is how much of the domain is affected.
+func (b *Business) domainWideFailure(domain domainname.DomainName, t totals, sources []sourceStats, named []Finding) (Finding, bool) {
+	explained := make(map[string]bool, len(named))
+	for _, f := range named {
+		explained[f.Subject] = true
+	}
+
+	var (
+		failing, blocked, excused, senders int
+		sender                             netip.Addr
+		seen                               = make(evidence)
+	)
+
+	for _, s := range sources {
+		if explained[s.ip.String()] || s.failing() == 0 {
+			continue
+		}
+
+		failing += s.failing()
+		blocked += s.blocked
+		excused += s.excused
+		senders++
+		sender = s.ip
+		seen.merge(s.evidence)
+	}
 
 	switch {
 	case t.volume < b.thresholds.MinimumVolume, failing == 0:
 		return Finding{}, false
-	case float64(failing)/float64(t.volume) < b.thresholds.FailureRate:
+	case share(failing, t.volume) < b.thresholds.FailureRate:
 		return Finding{}, false
-	case t.excused == failing:
+	case excused == failing:
 		return Finding{}, false
 	}
 
 	level := severity.Warning
-	if t.blocked > 0 {
+	if blocked > 0 {
 		level = severity.Critical
+	}
+
+	headline := fmt.Sprintf("%s of mail claiming %s is failing DMARC", percent(failing, t.volume), domain)
+	detail := fmt.Sprintf(
+		"%d of %s failed DMARC and %d %s blocked, spread across %s, none failing enough to be named on its own. "+
+			"That shape usually means the domain's own SPF or DKIM record is wrong rather than one server being misconfigured.",
+		failing, count(t.volume, "message", "messages"), blocked, were(blocked), count(senders, "sender", "senders"))
+
+	// One sender is not a domain-wide pattern, whatever kept it from being
+	// named: too little mail to judge on its own, or the first report ever.
+	action := fmt.Sprintf(
+		"Check the current SPF and DKIM records for %s — an include that stopped resolving, or a selector that no longer exists, produces exactly this pattern.",
+		domain)
+
+	if senders == 1 {
+		detail = fmt.Sprintf(
+			"%d of %s failed DMARC and %d %s blocked, all of them from %s, which sent too little to be judged on its own or has no history yet.",
+			failing, count(t.volume, "message", "messages"), blocked, were(blocked), sender)
+		action = fmt.Sprintf(
+			"Check what %s is: if it is one of ours, add it to the SPF record or sign its mail with a DKIM key published for %s. If it is not ours, someone is sending as %s.",
+			sender, domain, domain)
+	}
+
+	if len(explained) > 0 {
+		headline = "Another " + headline
+		detail = fmt.Sprintf(
+			"Apart from the senders above, %d of the domain's %s failed DMARC and %d %s blocked, from %s.",
+			failing, count(t.volume, "message", "messages"), blocked, were(blocked), count(senders, "other sender", "other senders"))
 	}
 
 	return Finding{
@@ -198,14 +314,9 @@ func (b *Business) domainWideFailure(domain domainname.DomainName, t totals, obs
 		Code:     "domain-failure-rate",
 		Domain:   domain,
 		Volume:   failing,
-		Headline: fmt.Sprintf("%s of mail claiming %s is failing DMARC", percent(failing, t.volume), domain),
-		Detail: fmt.Sprintf(
-			"Across %d reporting sources, %d of %d messages failed DMARC and %d were blocked. "+
-				"No single sender is responsible, which usually means the domain's own SPF or DKIM record is wrong rather than one server being misconfigured.",
-			len(reportersOf(obs)), failing, t.volume, t.blocked),
-		Action: fmt.Sprintf(
-			"Check the current SPF and DKIM records for %s — an include that stopped resolving, or a selector that no longer exists, produces exactly this pattern.",
-			domain),
+		Headline: headline,
+		Detail:   sentences(detail, seen.describe()),
+		Action:   action,
 	}, true
 }
 
@@ -258,44 +369,141 @@ type sourceStats struct {
 	orgs      []string
 	rejected  int
 
-	dkimPassed int
-	spfPassed  int
+	// blockers are the receivers that quarantined or rejected any of it, which
+	// is not every receiver that reported it.
+	blockers []string
+
+	// sampled is failing mail the receiver delivered only because pct= told
+	// it to skip the policy for that message.
+	sampled int
+
+	// evidence is what the receiver saw on the messages that failed.
+	evidence evidence
 }
+
+func (s sourceStats) failing() int { return s.volume - s.passing }
 
 // blockedVerb describes what actually happened, since "blocked" is not what an
 // operator will see in their own logs.
 func (s sourceStats) blockedVerb() string {
-	if s.rejected == s.blocked {
+	switch s.rejected {
+	case s.blocked:
 		return "rejected"
+	case 0:
+		return "quarantined"
+	default:
+		return "quarantined or rejected"
 	}
-
-	return "quarantined or rejected"
 }
 
-func (s sourceStats) orgList() string {
-	switch len(s.orgs) {
+func (s sourceStats) orgList() string { return listOrgs(s.orgs) }
+
+func listOrgs(orgs []string) string {
+	switch len(orgs) {
 	case 0:
 		return "the reporting receivers"
 	case 1:
-		return s.orgs[0]
+		return orgs[0]
 	default:
-		return fmt.Sprintf("%s and %d other receivers", s.orgs[0], len(s.orgs)-1)
+		return fmt.Sprintf("%s and %s", orgs[0], count(len(orgs)-1, "other receiver", "other receivers"))
 	}
 }
 
-// authSummary says which mechanism failed, which is the first thing anyone
-// investigating needs and the last thing a raw report makes obvious.
-func (s sourceStats) authSummary() string {
-	switch {
-	case s.dkimPassed == 0 && s.spfPassed == 0:
-		return "Neither SPF nor DKIM aligned"
-	case s.dkimPassed == 0:
-		return "DKIM did not align; SPF carried what passed"
-	case s.spfPassed == 0:
-		return "SPF did not align; DKIM carried what passed"
-	default:
-		return "Both mechanisms passed on some messages and not others"
+// evidence counts failing messages by what the receiver saw when it checked
+// them, which is the first thing anyone investigating needs and the last thing
+// a raw report makes obvious. Keyed by the description itself, so that rows
+// from different reports with the same story add up.
+type evidence map[string]int
+
+func (e evidence) add(o Observation) { e[checkedAs(o)] += o.Count }
+
+func (e evidence) merge(other evidence) {
+	for text, n := range other {
+		e[text] += n
 	}
+}
+
+// describe says what the failing messages had in common, most common first.
+// It names at most three patterns: past that, the report is the place to look.
+func (e evidence) describe() string {
+	const shown = 3
+
+	if len(e) == 0 {
+		return ""
+	}
+
+	total := 0
+	for _, n := range e {
+		total += n
+	}
+
+	patterns := slices.SortedFunc(maps.Keys(e), func(a, b string) int {
+		if c := cmp.Compare(e[b], e[a]); c != 0 {
+			return c
+		}
+
+		return strings.Compare(a, b)
+	})
+
+	switch {
+	case len(patterns) == 1 && total == 1:
+		return fmt.Sprintf("The one that failed had %s.", patterns[0])
+	case len(patterns) == 1:
+		return fmt.Sprintf("All %d that failed had %s.", total, patterns[0])
+	}
+
+	parts := make([]string, 0, shown+1)
+	rest := total
+	for _, p := range patterns[:min(shown, len(patterns))] {
+		parts = append(parts, fmt.Sprintf("%d had %s", e[p], p))
+		rest -= e[p]
+	}
+
+	if rest > 0 {
+		parts = append(parts, fmt.Sprintf("%d had other results", rest))
+	}
+
+	return fmt.Sprintf("Of the %d that failed, %s.", total, strings.Join(parts, "; "))
+}
+
+// checkedAs describes the raw results on one failing row: "SPF pass for
+// other.example (not aligned) and no DKIM signature". On a row that failed
+// DMARC, a raw pass can only mean the domain checked does not align.
+func checkedAs(o Observation) string {
+	parts := make([]string, 0, len(o.SPFChecked)+len(o.DKIMChecked)+2)
+
+	if len(o.SPFChecked) == 0 {
+		parts = append(parts, "no SPF result")
+	}
+	for _, c := range o.SPFChecked {
+		parts = append(parts, c.describe("SPF"))
+	}
+
+	if len(o.DKIMChecked) == 0 {
+		parts = append(parts, "no DKIM signature")
+	}
+	for _, c := range o.DKIMChecked {
+		parts = append(parts, c.describe("DKIM"))
+	}
+
+	return strings.Join(parts, " and ")
+}
+
+func (c Check) describe(mechanism string) string {
+	domain := "an unnamed domain"
+	if !c.Domain.IsZero() {
+		domain = c.Domain.String()
+	}
+
+	text := fmt.Sprintf("%s %s for %s", mechanism, cmp.Or(c.Result, "with no result"), domain)
+	if c.Selector != "" {
+		text += ", selector " + c.Selector
+	}
+	if strings.EqualFold(c.Result, "pass") {
+		text += " (not aligned)"
+	}
+
+	return text
 }
 
 // totals is one domain's arithmetic across every source.
@@ -333,7 +541,7 @@ func groupBySource(obs []Observation) []sourceStats {
 
 		s, ok := bySource[o.SourceIP]
 		if !ok {
-			s = &sourceStats{ip: o.SourceIP, known: o.KnownSource, firstEver: o.FirstEverReport}
+			s = &sourceStats{ip: o.SourceIP, known: o.KnownSource, firstEver: o.FirstEverReport, evidence: make(evidence)}
 			bySource[o.SourceIP] = s
 		}
 
@@ -353,13 +561,18 @@ func groupBySource(obs []Observation) []sourceStats {
 			if o.Disposition == disposition.Reject {
 				s.rejected += o.Count
 			}
+
+			if o.Org != "" && !slices.Contains(s.blockers, o.Org) {
+				s.blockers = append(s.blockers, o.Org)
+			}
 		}
 
-		if o.DKIM.Passed() {
-			s.dkimPassed += o.Count
-		}
-		if o.SPF.Passed() {
-			s.spfPassed += o.Count
+		if !o.Passed() {
+			s.evidence.add(o)
+
+			if !o.Blocked() && o.SampledOut() {
+				s.sampled += o.Count
+			}
 		}
 
 		if o.Org != "" && !slices.Contains(s.orgs, o.Org) {
@@ -370,6 +583,7 @@ func groupBySource(obs []Observation) []sourceStats {
 	stats := make([]sourceStats, 0, len(bySource))
 	for _, s := range bySource {
 		slices.Sort(s.orgs)
+		slices.Sort(s.blockers)
 		stats = append(stats, *s)
 	}
 
@@ -468,6 +682,47 @@ func summarize(obs []Observation) Summary {
 	})
 
 	return s
+}
+
+// share is part as a fraction of whole, or zero when there is no whole.
+func share(part, whole int) float64 {
+	if whole == 0 {
+		return 0
+	}
+
+	return float64(part) / float64(whole)
+}
+
+// count is n with the noun that agrees with it: "1 message", "7 messages".
+func count(n int, one, many string) string {
+	if n == 1 {
+		return "1 " + one
+	}
+
+	return strconv.Itoa(n) + " " + many
+}
+
+// were is the verb that agrees with n.
+func were(n int) string {
+	if n == 1 {
+		return "was"
+	}
+
+	return "were"
+}
+
+// allOf is how the subject of "authenticated correctly" agrees with n.
+func allOf(n int) string {
+	if n == 1 {
+		return "it"
+	}
+
+	return "they all"
+}
+
+// sentences joins the non-empty ones with a space.
+func sentences(parts ...string) string {
+	return strings.Join(slices.DeleteFunc(parts, func(p string) bool { return p == "" }), " ")
 }
 
 func percent(part, whole int) string {

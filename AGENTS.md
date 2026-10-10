@@ -45,18 +45,11 @@
 - If you believe a task genuinely cannot be done without live credentials, say
   so and stop. Do not proceed on the assumption that read-only makes it fine.
 
-**Standing exception (granted 2026-08-14):** the account currently in
-`credentials.env` is a *disposable test mailbox*, seeded with a handful of real
-DMARC reports for development. Connecting to it — `-check`, `-once -dry-run`,
-reading and flagging its messages — is explicitly permitted. The exception is
-about that mailbox, not about the file: still never print the credentials, and
-still never send a real alert without `-dry-run` unless the user asks for it in
-that turn. When the mailbox is swapped for the production one, this paragraph
-must be deleted.
-
-That file is written by `make local-credentials` from the `DEV_*` group of
-`secrets.env`. The production mailbox is the runtime group of the same file and
-reaches only the server; the exception never covers it.
+`credentials.env` on a developer's machine is written by `make
+local-credentials` from the `DEV_*` group of `secrets.env`. As of 2026-10-10
+that account receives the live reports, so the rules above apply to it in full:
+`make run`, `make check` and `make test-integration` all connect to it. A
+standing exception for a disposable test mailbox was withdrawn on that date.
 
 ## Alerting is outward-facing
 

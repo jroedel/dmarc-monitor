@@ -15,9 +15,9 @@ feature.
 
 | Finding | Severity | Meaning |
 |---|---|---|
-| `blocked-known-source` | critical | A server this domain has used before is having its mail quarantined or rejected. Mail is being lost right now. |
-| `domain-failure-rate` | warning / critical | The domain as a whole is failing more than the threshold, with no single sender responsible — usually a broken SPF include or a removed DKIM record. |
-| `failing-known-source` | warning | A known sender is failing authentication while the policy is still `p=none`. The window in which the fix is free. |
+| `blocked-known-source` | critical / warning | A server this domain has used before is having its mail quarantined or rejected. Mail is being lost right now. Critical when the share of that server's mail *failing* is over `TRIAGE_FAILURE_RATE` — failing, not blocked, because under `pct=` below 100 a receiver blocks only a sample of what fails. Below it, a warning about the handful of messages it is. |
+| `domain-failure-rate` | warning / critical | Failures that no sender above accounts for still add up to more than the threshold of the domain's mail — usually a broken SPF include or a removed DKIM record. |
+| `failing-known-source` | warning | A known sender is failing authentication and nothing was blocked: under `p=none`, the window in which the fix is free; under an enforcing policy, mail that `pct=` sampling let through this time. |
 | `new-source` | notice / warning | An IP that has never sent for this domain is now sending at volume. Either a service somebody signed up for, or spoofing. |
 | `ready-to-enforce` | notice | Everything passes, at volume, from several sources — and the policy is still `p=none`, protecting nothing. |
 
@@ -26,8 +26,14 @@ already been sent stays quiet for `ALERT_COOLDOWN` (default 72h), per finding,
 so an unfixed problem does not mail the webmaster daily while a *new* problem
 still gets through immediately.
 
+Every finding about failing mail quotes what the receiver saw on it — which
+domain SPF was checked against, and which DKIM signature, if any — since that,
+not the word "failed", is what says what to fix.
+
 Deliberately silent: failures the receiver itself excused (`forwarded`,
-`mailing_list`), mail whose header-from does not align with the domain at all,
+`trusted_forwarder`, `mailing_list`). `sampled_out` is not an excuse: it means
+only that `pct=` let a failing message through, and it would be blocked at
+`pct=100`. Also silent: mail whose header-from does not align with the domain at all,
 every sender on the very first run, and any rate computed over fewer than
 `TRIAGE_MIN_VOLUME` messages.
 

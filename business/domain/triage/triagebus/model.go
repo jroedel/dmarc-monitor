@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/netip"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/jroedel/dmarc-monitor/business/types/authresult"
@@ -50,6 +51,14 @@ type Observation struct {
 	// that a failure is expected and uninteresting.
 	Overrides []string
 
+	// SPFChecked and DKIMChecked are the receiver's raw results, before
+	// alignment: which domain each mechanism was checked against, and what
+	// came back. They decide nothing. They are what a finding quotes, because
+	// "DMARC failed" is not actionable and "SPF passed for another domain and
+	// there was no DKIM signature" is.
+	SPFChecked  []Check
+	DKIMChecked []Check
+
 	// KnownSource is whether this IP has sent for this domain before, according
 	// to the checkpoint. Supplied by the App layer, because remembering across
 	// runs is not something a Business domain should own.
@@ -67,9 +76,37 @@ func (o Observation) Passed() bool { return o.DKIM.Passed() || o.SPF.Passed() }
 // Blocked reports whether the receiver withheld the messages from the inbox.
 func (o Observation) Blocked() bool { return !o.Disposition.Delivered() }
 
-// Excused reports whether the receiver told us it had a reason to depart from
-// policy — forwarding, a mailing list, sampling. Those failures are expected.
-func (o Observation) Excused() bool { return len(o.Overrides) > 0 }
+// Check is one raw authentication result from a report's <auth_results>.
+// Result is the receiver's own word — pass, fail, softfail, none, temperror —
+// and deliberately not an authresult: that type is the aligned, binary
+// verdict, and this is the evidence behind it.
+type Check struct {
+	Domain   domainname.DomainName
+	Selector string // DKIM only
+	Result   string
+}
+
+// excuses are the overrides that explain a failure: the mail was relayed by
+// something that breaks authentication as a matter of course. The other
+// overrides say the receiver did not apply the policy, not that the failure
+// was expected — sampled_out above all, which only means pct= let the
+// message through this time.
+var excuses = []string{"forwarded", "trusted_forwarder", "mailing_list"}
+
+// Excused reports whether the receiver said why these messages were expected
+// to fail: forwarding or a mailing list.
+func (o Observation) Excused() bool { return o.overridden(excuses...) }
+
+// SampledOut reports whether the receiver skipped the policy for these
+// messages only because the policy's pct= told it to. Failing mail that was
+// sampled out is mail that a pct=100 would have blocked.
+func (o Observation) SampledOut() bool { return o.overridden("sampled_out") }
+
+func (o Observation) overridden(types ...string) bool {
+	return slices.ContainsFunc(o.Overrides, func(got string) bool {
+		return slices.ContainsFunc(types, func(want string) bool { return strings.EqualFold(got, want) })
+	})
+}
 
 // Finding is one thing worth saying to a human, already graded.
 type Finding struct {
