@@ -34,6 +34,11 @@ type State struct {
 	SeenReports     map[string]time.Time `json:"seen_reports,omitempty"`
 	KnownSources    map[string][]string  `json:"known_sources,omitempty"`
 	AlertedFindings map[string]time.Time `json:"alerted_findings,omitempty"`
+
+	// RunningVersion is the build that last ran a scheduled cycle here. A
+	// deploy replaces the binary from outside, so the first run of a new build
+	// is the only moment anything on the server can notice that one landed.
+	RunningVersion string `json:"running_version,omitempty"`
 }
 
 // Store is the state file.
@@ -113,6 +118,7 @@ func Open(path string) (*Store, error) {
 		s.state.AlertedFindings = loaded.AlertedFindings
 	}
 	s.state.LastRun = loaded.LastRun
+	s.state.RunningVersion = loaded.RunningVersion
 
 	return &s, nil
 }
@@ -171,13 +177,40 @@ func (s *Store) MarkAlerted(fingerprint string, t time.Time) {
 // this is the first ever run.
 func (s *Store) LastRun() time.Time { return s.state.LastRun }
 
-// Save prunes expired entries and writes the file atomically: a temporary file
-// in the same directory, then a rename. A half-written state file that lost the
-// seen-report list would re-alert on everything in it.
+// RunningVersion returns the build that last ran a scheduled cycle here; empty
+// if none was ever recorded, which is every installation that predates it.
+func (s *Store) RunningVersion() string { return s.state.RunningVersion }
+
+// RecordVersion notes that version is the build running now and writes the
+// file at once.
+//
+// It writes immediately rather than waiting for Save, because Save happens only
+// after a cycle succeeds. A deploy whose first cycle then failed to reach the
+// mailbox would otherwise announce itself again on every run until one did.
+// LastRun is left alone: recording a version is not a successful cycle.
+func (s *Store) RecordVersion(version string) error {
+	if s.state.RunningVersion == version {
+		return nil
+	}
+
+	s.state.RunningVersion = version
+
+	return s.write()
+}
+
+// Save prunes expired entries and writes the file.
 func (s *Store) Save(now time.Time) error {
-	s.state.Version = currentVersion
 	s.state.LastRun = now
 	s.prune(now)
+
+	return s.write()
+}
+
+// write writes the file atomically: a temporary file in the same directory,
+// then a rename. A half-written state file that lost the seen-report list would
+// re-alert on everything in it.
+func (s *Store) write() error {
+	s.state.Version = currentVersion
 
 	dir := filepath.Dir(s.path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {

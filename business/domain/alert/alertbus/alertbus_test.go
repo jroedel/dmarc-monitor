@@ -180,13 +180,14 @@ func TestNoticeIsPrefixedAndDelivered(t *testing.T) {
 	}
 }
 
-// A release tag is attacker-influenced in the same way a report is: it reaches
-// the subject line from outside.
+// A deployed version is a git tag name and the host is whatever the machine
+// calls itself; both reach the subject line from outside, the same way a
+// report's contents do.
 func TestNoticeSubjectCannotBeInjected(t *testing.T) {
 	sender := &capturingSender{}
 
 	notice := alertbus.Notice{
-		Subject: "updated to v1.2.0\r\nBcc: attacker@evil.example",
+		Subject: "deployed v1.2.0\r\nBcc: attacker@evil.example",
 		Body:    "x",
 	}
 

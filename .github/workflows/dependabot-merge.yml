@@ -1,0 +1,147 @@
+# Merge Dependabot's pull requests once they have sat for a day with CI green,
+# then deploy, then say so if the deploy failed. Taken from eumaeus.
+#
+# Dependency bumps are not a person's job. CI already decides whether a bump
+# builds, tests, vets and scans clean, and the deploy pre-flights the new build
+# against the live mailbox before it swaps anything. What was left for a
+# person was to click merge, and clicking merge is not judgement. This does
+# the click.
+#
+# # Why a day
+#
+# A day is long enough for a bad release to be yanked or followed by a fix,
+# and for you to see the pull request in the list if you happened to look. It
+# is not a review window: nobody is expected to review these. It is a buffer.
+#
+# # Why it dispatches the deploy itself
+#
+# A push made with the repository's token does not trigger workflows -- GitHub
+# stops there so a workflow cannot start an infinite chain of itself. So the
+# merge alone would land a bump on main and never deploy it. workflow_dispatch
+# is the exception to that rule, so this dispatches the deploy, waits for it,
+# and fails if it failed -- and a failed scheduled workflow emails the person
+# who last committed this file, which is the one email you want from any of
+# this.
+#
+# # Its own concurrency group, not the deploy's
+#
+# It waits on the deploy it dispatches. In the deploy's group, that deploy
+# would queue behind this run, and this run would wait for it until it timed
+# out.
+
+name: Merge Dependabot
+
+on:
+  schedule:
+    # 06:30 UTC daily: hours clear of the 08:00 and 20:00 Chicago runs (13:00
+    # or 14:00, and 01:00 or 02:00, UTC, with daylight saving), so a merged
+    # bump is live well before the next scheduled cycle.
+    - cron: "30 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  actions: write
+
+concurrency:
+  group: dependabot-merge
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # Same tripwire as the deploy: no server, nothing to deploy a bump to, and
+    # a merge without a deploy would leave main ahead of production quietly.
+    if: vars.APP_DIR != ''
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+
+    steps:
+      - name: Merge what has waited a day and passed
+        id: merge
+        run: |
+          set -euo pipefail
+
+          merged=0
+          cutoff=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+
+          gh pr list --author app/dependabot --state open \
+            --json number,title,createdAt,mergeable,headRefOid \
+            -q '.[] | "\(.number)\t\(.createdAt)\t\(.mergeable)\t\(.headRefOid)\t\(.title)"' \
+            > prs.tsv
+
+          if [ ! -s prs.tsv ]; then
+            echo "no open Dependabot pull requests"
+            echo "merged=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          while IFS=$'\t' read -r number created mergeable sha title; do
+            echo "#${number}: ${title}"
+
+            if [ "$created" \> "$cutoff" ]; then
+              echo "   opened ${created}, under a day old; waiting"
+              continue
+            fi
+
+            if [ "$mergeable" != "MERGEABLE" ]; then
+              echo "   ${mergeable}; Dependabot rebases these itself, so next time"
+              continue
+            fi
+
+            # Every check run on the head commit must have concluded, and
+            # concluded success. A check still running is "not yet", not
+            # "passed"; a check that was skipped is not a pass either.
+            verdict=$(gh api "repos/${GH_REPO}/commits/${sha}/check-runs" \
+              -q '[.check_runs[] | .conclusion // "pending"] | if length == 0 then "none" elif all(. == "success") then "green" else join(",") end' \
+              2>/dev/null || echo "unreadable")
+
+            if [ "$verdict" != "green" ]; then
+              echo "   checks: ${verdict}; not merging"
+              continue
+            fi
+
+            echo "   a day old, mergeable, CI green: merging"
+            gh pr merge "$number" --merge --delete-branch
+            merged=$((merged + 1))
+          done < prs.tsv
+
+          echo "merged=${merged}" >> "$GITHUB_OUTPUT"
+
+      # The deploy, dispatched because the merge above cannot trigger it, and
+      # watched so that a failure here is a failure of this run -- which is
+      # what gets emailed.
+      - name: Deploy what was merged, and fail if the deploy did
+        if: steps.merge.outputs.merged != '0'
+        run: |
+          set -euo pipefail
+          since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          gh workflow run deploy.yml --ref main
+
+          run_id=""
+          for _ in $(seq 12); do
+            sleep 5
+            run_id=$(gh run list --workflow deploy.yml --event workflow_dispatch --limit 3 \
+              --json databaseId,createdAt \
+              -q "[.[] | select(.createdAt >= \"$since\")] | .[0].databaseId // empty")
+            [ -n "$run_id" ] && break
+          done
+
+          [ -n "$run_id" ] || { echo "dispatched the deploy but cannot find its run"; exit 1; }
+
+          echo "deploy run ${run_id}; waiting"
+          if gh run watch "$run_id" --exit-status; then
+            echo "deployed"
+          else
+            echo "the deploy of the merged bump FAILED. Nothing on the server changes"
+            echo "unless the pre-flight passed, so the old build is most likely still"
+            echo "running; this run is red so that you hear about it:"
+            echo "  gh run view ${run_id} --log-failed"
+            exit 1
+          fi

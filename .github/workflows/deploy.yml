@@ -1,0 +1,104 @@
+# A push to main that passes the checks goes to the server.
+#
+# `ship` runs deploy/deploy.sh deploy: build a static binary, upload it beside
+# the live one, pre-flight it with -check against the live credentials, back up
+# state.json, swap with a rename, and install the crontab line. There is no
+# separate install; the first run is one. The new build announces itself by
+# mail on its first scheduled run (ALERT_ON_UPDATE).
+#
+# Two jobs, and the second `needs` the first, so a red test is a deploy that
+# never starts. The checks repeat ci.yml's rather than trusting that the run
+# which produced this commit was the run that passed.
+#
+# What this workflow deliberately does not have: any runtime credential. The
+# mailbox and relay passwords reach the server's credentials.env from a
+# person's machine with `make deploy-send-secrets`, so a compromise of this
+# workflow can ship code to a no-root shared hosting account, and the
+# repository being public means its logs are public too: deploy.sh prints
+# nothing the binary says about the mailbox.
+name: deploy
+
+on:
+  push:
+    branches: [main]
+
+  # A deploy that only a commit can trigger is one that cannot be re-run after
+  # a transient ssh failure without an empty commit. It is also how the
+  # Dependabot merge deploys: a merge made with the workflow token does not
+  # trigger a push event.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One deploy at a time, and a newer push waits rather than racing an older one.
+# Each run that finds main has moved on stops before touching anything.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    # With nowhere to deploy to, skip rather than go red. APP_DIR is the
+    # sentinel because it is a variable, so the condition can be read, and
+    # make deploy-send-secrets is what sets it.
+    if: vars.APP_DIR != ''
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: lint
+        run: make lint
+
+      - name: unit tests, with the race detector
+        run: make test-unit
+
+      - name: shell tests
+        run: make shell-test
+
+  ship:
+    needs: check
+    runs-on: ubuntu-latest
+    if: vars.APP_DIR != ''
+
+    # Named so that a required reviewer can be added in the repository
+    # settings without touching this file.
+    environment: production
+
+    steps:
+      # The whole history and its tags, because the version stamped into the
+      # binary is git describe's answer, and a shallow clone describes every
+      # build as a bare hash.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: deploy
+        env:
+          DEPLOY_SSH_KEY_B64: ${{ secrets.DEPLOY_SSH_KEY_B64 }}
+          DEPLOY_KNOWN_HOSTS_B64: ${{ secrets.DEPLOY_KNOWN_HOSTS_B64 }}
+          DEPLOY_SSH_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
+          DEPLOY_SSH_USER: ${{ secrets.DEPLOY_SSH_USER }}
+          DEPLOY_SSH_PORT: ${{ secrets.DEPLOY_SSH_PORT }}
+
+          # Variables, not secrets. A path and a count are not confidential,
+          # and a masked log is harder to read when a deploy goes wrong.
+          APP_DIR: ${{ vars.APP_DIR }}
+          KEEP_BACKUPS: ${{ vars.KEEP_BACKUPS }}
+
+          # A runner's checkout is a detached HEAD, and the trigger already is
+          # "a commit on main".
+          SKIP_GIT_CHECK: "1"
+        run: deploy/deploy.sh deploy

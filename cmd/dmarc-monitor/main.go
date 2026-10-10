@@ -9,11 +9,12 @@
 //	dmarc-monitor -check              prove the mailbox and relay are reachable
 //	dmarc-monitor -once -dry-run      run a full cycle, print the alert, send nothing
 //	dmarc-monitor -once               run a full cycle for real
-//	dmarc-monitor -cron               what the crontab runs: lock, self-update, one cycle
+//	dmarc-monitor -cron               what the crontab runs: lock, one cycle, deploy notice
 //	dmarc-monitor -watch              poll forever
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"flag"
@@ -38,29 +39,31 @@ import (
 	"github.com/jroedel/dmarc-monitor/foundation/config"
 	"github.com/jroedel/dmarc-monitor/foundation/lockfile"
 	"github.com/jroedel/dmarc-monitor/foundation/logger"
-	"github.com/jroedel/dmarc-monitor/foundation/selfupdate"
 )
 
-// version is stamped at link time by the release build:
+// version and commit are stamped at link time by deploy/deploy.sh:
 //
-//	go build -ldflags "-X main.version=v1.2.3"
+//	go build -ldflags "-X main.version=v0.1.5-3-gabc1234 -X main.commit=abc1234..."
 //
-// An unstamped build reports "dev" and is treated by the updater as older than
-// any published release, so a hand-built binary left on a server adopts the
-// real one at the next run.
-var version = selfupdate.DevVersion
+// version is git describe's answer, so it names the last tag and how far past
+// it the build is; commit is the full hash the deploy notice links to. An
+// unstamped build reports "dev" and no commit.
+var (
+	version = "dev"
+	commit  = ""
+)
 
-// updateRepo is where updates come from. A constant rather than a setting: a
-// credentials file that could redirect the update source would turn a mail
-// misconfiguration into arbitrary code execution.
-const updateRepo = "jroedel/dmarc-monitor"
+// sourceRepo is where a commit hash is looked up, for the link in the deploy
+// notice.
+const sourceRepo = "https://github.com/jroedel/dmarc-monitor"
 
-// scheduleZone is the timezone deploy/crontab.example schedules in. The crontab
-// guard asks the system for the hour in this zone, and if the zone cannot be
-// resolved the shell's date silently answers in UTC instead — which would move
-// every run by two hours in winter and three in summer, without an error
-// anywhere. -check resolves it here so that failure is found at install time by
-// someone who is looking, rather than months later by nobody.
+// scheduleZone is the timezone the crontab line deploy/deploy.sh installs
+// schedules in. The crontab guard asks the system for the hour in this zone,
+// and if the zone cannot be resolved the shell's date silently answers in UTC
+// instead — which would move every run by two hours in winter and three in
+// summer, without an error anywhere. -check resolves it here so that failure
+// is found at install time by someone who is looking, rather than months later
+// by nobody.
 const scheduleZone = "America/Chicago"
 
 func main() {
@@ -82,7 +85,6 @@ type flags struct {
 	debug       bool
 	logFormat   string
 	cron        bool
-	noUpdate    bool
 	showVersion bool
 	testAlert   bool
 }
@@ -99,8 +101,7 @@ func run() error {
 	flag.BoolVar(&f.watch, "watch", false, "poll on the configured interval until interrupted")
 	flag.BoolVar(&f.dryRun, "dry-run", false, "print the alert that would be sent; send nothing, change nothing")
 	flag.BoolVar(&f.includeSeen, "include-seen", false, "examine every message, not only unread ones (for a first run over an existing archive)")
-	flag.BoolVar(&f.cron, "cron", false, "what a crontab entry runs: take the lock, self-update, run one cycle, exit")
-	flag.BoolVar(&f.noUpdate, "no-update", false, "with -cron, skip the self-update check")
+	flag.BoolVar(&f.cron, "cron", false, "what a crontab entry runs: take the lock, run one cycle, exit; mails once when a new build is deployed")
 	flag.BoolVar(&f.showVersion, "version", false, "print the version and exit")
 	flag.BoolVar(&f.debug, "debug", false, "log at debug level")
 	flag.StringVar(&f.logFormat, "log", "text", "log format: text or json")
@@ -128,11 +129,6 @@ func run() error {
 		return err
 	}
 
-	var (
-		update  installed
-		updated bool
-	)
-
 	if f.cron {
 		lock, err := lockfile.Acquire(filepath.Join(filepath.Dir(statePath), "run.lock"))
 		if errors.Is(err, lockfile.ErrHeld) {
@@ -144,12 +140,6 @@ func run() error {
 			return err
 		}
 		defer lock.Release()
-
-		// Before the config is loaded, so that a server whose credentials are
-		// not filled in yet still picks up new builds.
-		if !f.noUpdate {
-			update, updated = updateCheck(context.Background(), log)
-		}
 	}
 
 	cfg, err := config.Load(credentialsPath)
@@ -235,11 +225,15 @@ func run() error {
 		log.Info("using local model for alert narratives", "endpoint", cfg.LLMEndpoint, "model", cfg.LLMModel)
 	}
 
-	// Sent before the cycle, not after: this mail is proof that a new build
-	// reached the machine, and it should arrive even if the cycle that follows
-	// then fails to reach the mailbox.
-	if updated && cfg.NotifyOnUpdate {
-		notify(ctx, log, alerts, update, f.dryRun)
+	// Only under -cron, because that is what the server runs: a person trying
+	// a new build by hand with -once is not a deploy, and must not use up the
+	// notice the scheduled run is about to send.
+	//
+	// Before the cycle, not after: this mail is proof that a new build reached
+	// the machine, and it should arrive even if the cycle that follows then
+	// fails to reach the mailbox.
+	if f.cron {
+		announceDeploy(ctx, log, alerts, state, cfg.NotifyOnUpdate, f.dryRun)
 	}
 
 	m := monitor.New(
@@ -273,85 +267,60 @@ func run() error {
 	return nil
 }
 
-// update checks for a newer published release and installs it.
+// announceDeploy mails the deploy notice on the first scheduled run of a new
+// build, or prints it under -dry-run.
 //
-// Every failure here is logged and swallowed. An update is a convenience; the
-// monitor's job is to read the mailbox, and it can do that perfectly well on
-// the build it already has. GitHub being unreachable must never be the reason a
-// webmaster is not told their mail is being rejected.
+// The deploy replaces the binary from outside and does not run a cycle, so this
+// run is the first moment anything on the server knows a new build landed. The
+// version is recorded whether or not the notice is wanted, so that turning
+// ALERT_ON_UPDATE back on later does not announce a deploy from weeks ago.
 //
-// The new binary lands on disk but does not take effect until the next cron
-// run. Nothing is re-executed mid-cycle: a program that swapped itself out
-// halfway through reading a mailbox would be a much harder thing to reason
-// about than one that is simply newer tomorrow morning.
-// installed describes an update that landed, for the notice sent afterwards.
-type installed struct {
-	from string
-	to   string
-	url  string
-}
-
-func updateCheck(ctx context.Context, log *slog.Logger) (installed, bool) {
-	updater := selfupdate.New(selfupdate.Config{
-		Repo:           updateRepo,
-		CurrentVersion: version,
-		AssetName:      fmt.Sprintf("dmarc-monitor-%s-%s", runtime.GOOS, runtime.GOARCH),
-	})
-
-	release, available, err := updater.Latest(ctx)
-	switch {
-	case err != nil:
-		log.Warn("update check failed; carrying on with the current build", "version", version, "err", err)
-
-		return installed{}, false
-	case !available:
-		log.Debug("no newer release", "version", version)
-
-		return installed{}, false
+// Failures are logged and swallowed. The notice is a convenience -- the deploy
+// already happened and its own log records it -- and a relay that is refusing
+// mail must not stop the cycle that is about to look for reports. The version
+// is recorded before the mail goes, for the same reason: a relay that is down
+// costs one notice, rather than a notice on every run until it comes back.
+func announceDeploy(ctx context.Context, log *slog.Logger, alerts *alertbus.Business, state *checkpoint.Store, enabled, dryRun bool) {
+	previous := state.RunningVersion()
+	if previous == version {
+		return
 	}
 
-	log.Info("installing a newer release", "from", version, "to", release.Version, "url", release.URL)
-
-	if err := updater.Apply(ctx, release); err != nil {
-		log.Warn("update failed; carrying on with the current build", "version", version, "err", err)
-
-		return installed{}, false
+	if !dryRun {
+		if err := state.RecordVersion(version); err != nil {
+			log.Warn("could not record the running version; the deploy notice may repeat", "err", err)
+		}
 	}
 
-	log.Info("update installed; it takes effect at the next run", "version", release.Version)
+	log.Info("first scheduled run of a new build", "from", previous, "to", version, "commit", commit)
 
-	return installed{from: version, to: release.Version, url: release.URL}, true
-}
+	if !enabled {
+		return
+	}
 
-// notify mails the update notice, or prints it under -dry-run.
-//
-// Failures are logged and swallowed. The notice is a convenience — the update
-// has already happened and the log already records it — and a relay that is
-// refusing mail must not stop the cycle that is about to look for reports.
-func notify(ctx context.Context, log *slog.Logger, alerts *alertbus.Business, update installed, dryRun bool) {
 	path, err := os.Executable()
 	if err != nil {
 		path = "the installed binary"
 	}
 
-	notice := updateNotice(update, path)
+	notice := deployNotice(deployed{from: previous, to: version, commit: commit}, path)
 
 	if dryRun {
 		msg, err := alerts.RenderNotice(notice)
 		if err != nil {
-			log.Warn("could not render the update notice", "err", err)
+			log.Warn("could not render the deploy notice", "err", err)
 
 			return
 		}
 
-		fmt.Printf("DRY RUN — the update notice that would be sent:\n\nTo:         %s\nMessage-ID: %s\nSubject:    %s\n\n%s\n",
+		fmt.Printf("DRY RUN — the deploy notice that would be sent:\n\nTo:         %s\nMessage-ID: %s\nSubject:    %s\n\n%s\n",
 			joinAddresses(msg), msg.ID, msg.Subject, msg.Body)
 
 		return
 	}
 
 	if _, err := alerts.Notify(ctx, notice); err != nil {
-		log.Warn("could not send the update notice; the update itself was fine", "err", err)
+		log.Warn("could not send the deploy notice; the deploy itself was fine", "err", err)
 	}
 }
 
@@ -427,12 +396,19 @@ func testNotice() alertbus.Notice {
 	}
 }
 
-// updateNotice is the mail sent when a new build lands.
+// deployed describes the build change a deploy notice reports.
+type deployed struct {
+	from   string
+	to     string
+	commit string
+}
+
+// deployNotice is the mail sent on the first run of a new build.
 //
 // Short on purpose. Its whole job is to say that the pipeline reached this
 // machine, so it names the versions, the host and the file, and stops. Anyone
-// who wants more has the release page linked.
-func updateNotice(update installed, path string) alertbus.Notice {
+// who wants more has the commit linked.
+func deployNotice(d deployed, path string) alertbus.Notice {
 	host, err := os.Hostname()
 	if err != nil {
 		host = "an unknown host"
@@ -440,16 +416,21 @@ func updateNotice(update installed, path string) alertbus.Notice {
 
 	var b strings.Builder
 
-	fmt.Fprintf(&b, "dmarc-monitor updated itself on %s.\n\n", host)
-	fmt.Fprintf(&b, "  from     %s\n", update.from)
-	fmt.Fprintf(&b, "  to       %s\n", update.to)
+	fmt.Fprintf(&b, "dmarc-monitor is running a newly deployed build on %s.\n\n", host)
+	// Every installation that predates the deploy notice has no version
+	// recorded, so the first notice after the switch would otherwise show an
+	// empty field where the old version belongs.
+	fmt.Fprintf(&b, "  from     %s\n", cmp.Or(d.from, "(not recorded)"))
+	fmt.Fprintf(&b, "  to       %s\n", d.to)
 	fmt.Fprintf(&b, "  binary   %s\n", path)
-	fmt.Fprintf(&b, "  release  %s\n", update.url)
-	b.WriteString("\nThe new build takes effect at the next scheduled run; this one finished on the old one.\n")
+	if d.commit != "" {
+		fmt.Fprintf(&b, "  commit   %s/commit/%s\n", sourceRepo, d.commit)
+	}
+	b.WriteString("\nThis is the new build's first scheduled run; it goes on to read the mailbox as usual.\n")
 	b.WriteString("\nThis mail means the deployment pipeline works. Set ALERT_ON_UPDATE=false to stop it.\n")
 
 	return alertbus.Notice{
-		Subject: fmt.Sprintf("updated to %s on %s", update.to, host),
+		Subject: fmt.Sprintf("deployed %s on %s", d.to, host),
 		Body:    b.String(),
 	}
 }
@@ -540,7 +521,7 @@ func reportSchedule() {
 
 	fmt.Printf("\nLocal time here is %s; in %s it is %s.\n",
 		now.Format("15:04 MST"), scheduleZone, now.In(loc).Format("15:04 MST"))
-	fmt.Printf("deploy/crontab.example runs at 08:00 and 20:00 %s, which is %s and %s here today.\n",
+	fmt.Printf("The deployed crontab line runs at 08:00 and 20:00 %s, which is %s and %s here today.\n",
 		scheduleZone,
 		nextAt(now, loc, 8).Local().Format("15:04 MST"),
 		nextAt(now, loc, 20).Local().Format("15:04 MST"))

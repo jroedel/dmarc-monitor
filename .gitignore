@@ -24,3 +24,11 @@ credentials.env
 # Local, per-machine working area
 local/
 *.tmp
+
+# secrets.env holds the deploy key and the production mailbox password; it
+# lives in Bitwarden. secrets.env.example is the committed template.
+secrets.env
+secrets.env.bak
+
+# make release-build
+/dmarc-monitor-linux-amd64

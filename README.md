@@ -89,180 +89,130 @@ to intercept — and is refused for any other host, or if a password is set.
 
 ## Deploying it
 
-Two steps. No binary to download by hand, nothing to install.
+**A merge to main is a deploy.** `.github/workflows/deploy.yml` re-runs the
+checks and then `deploy/deploy.sh deploy`, which, over ssh to the konsoleH
+account:
 
-**1. Write the credentials** to `~/dmarc-monitor/credentials.env` on the server:
+1. builds a static linux/amd64 binary, stamped with `git describe` and the
+   commit;
+2. uploads it beside the live one;
+3. **pre-flights it**: the new binary runs `-check` on the server against the
+   live `credentials.env`, so a build that will not start there, will not
+   accept the credentials, or cannot log in to the mailbox or the relay is a
+   deploy that changes nothing;
+4. stops if a newer commit reached main meanwhile (its own deploy follows);
+5. backs up `state.json` (keeping `KEEP_BACKUPS`);
+6. swaps the binary with a rename, keeping the old one as `dmarc-monitor.prev`
+   — a cron run in progress finishes on its own inode, the next starts on the
+   new build;
+7. installs its crontab line, removing only its own marked line (and the
+   self-updating line from before ssh deploys); the other projects' lines and
+   `MAILTO` are left alone.
 
-```bash
-mkdir -p ~/dmarc-monitor && chmod 700 ~/dmarc-monitor
-cat > ~/dmarc-monitor/credentials.env <<'EOF'
-IMAP_HOST=mail.your-server.de
-IMAP_USERNAME=dmarc@yourdomain.example
-IMAP_PASSWORD=...
-SMTP_HOST=mail.your-server.de
-SMTP_USERNAME=alerts@yourdomain.example
-SMTP_PASSWORD=...
-ALERT_FROM=dmarc@yourdomain.example
-ALERT_TO=webmaster@yourdomain.example
-EOF
-chmod 600 ~/dmarc-monitor/credentials.env
-```
+The first scheduled run of a new build mails **`[dmarc] deployed <version> on
+<host>`**, naming both versions and linking the commit. That mail is the proof
+the deploy reached the machine, from the machine's own side; it is sent once,
+before the cycle, so it arrives even if that cycle then fails.
+`ALERT_ON_UPDATE=false` in `secrets.env` turns it off.
 
-Those are the only keys without a default. Everything else is documented in the
-annotated template — and if you would rather have that than the block above,
-skip this step, let step 2 run once, and it writes the template there for you.
+Nothing about the mailbox is ever in GitHub. The repository and its Actions
+logs are public, so CI holds only the ssh deploy key; the mailbox and relay
+passwords reach the server from a person's machine.
 
-**2. Add the crontab entry** with `crontab -e` (`deploy/crontab.example` is the
-annotated version, and `make crontab` prints it):
+### secrets.env
 
-```cron
-MAILTO=you@example.com
-
-0 * * * * H="$(TZ=America/Chicago date +\%H)"; [ "$H" = 08 ] || [ "$H" = 20 ] || exit 0; D="$HOME/dmarc-monitor"; B="$D/dmarc-monitor"; mkdir -p "$D"; [ -x "$B" ] || { curl -fsSL "https://github.com/jroedel/dmarc-monitor/releases/latest/download/dmarc-monitor-linux-amd64" -o "$B" && chmod +x "$B"; }; "$B" -cron >> "$D/cron.log" 2>&1 || echo "dmarc-monitor failed; see $D/cron.log"
-```
-
-That is the whole deployment. The first scheduled run fetches the binary and
-keeps it current from then on.
-
-### Starting it now instead of at the next scheduled hour
-
-There is no binary to invoke yet — the crontab line is what downloads it — so
-this is the same fetch, by hand:
+Every credential lives in one file, `secrets.env`, kept in Bitwarden and never
+committed; `secrets.env.example` documents it. Its groups go to different
+places: `DEPLOY_*` to GitHub secrets, `APP_*` to GitHub variables, the runtime
+keys to the server's `credentials.env`, and `DEV_*` to this machine's. From a
+person's machine:
 
 ```bash
-D="$HOME/dmarc-monitor"; B="$D/dmarc-monitor"; mkdir -p "$D"; \
-  curl -fsSL "https://github.com/jroedel/dmarc-monitor/releases/latest/download/dmarc-monitor-linux-amd64" \
-  -o "$B" && chmod +x "$B" && "$B" -version
+make deploy-keygen          # mint the deploy key; install its public half on konsoleH
+make deploy-known-hosts     # pin the server's host key
+make deploy-send-secrets    # GitHub secrets + variables; credentials.env to the server
+make deploy-status          # is everything in place? says what is not
+make local-credentials      # the DEV_* group, for make run / make check
 ```
 
-After that the usual checks work, and the first real run wants `-include-seen`
-once, to sweep up reports already sitting read in the mailbox:
+`deploy-send-secrets` writes `credentials.env` only if the binary on the server
+accepts it and can log in with it (`-check`, which sends nothing), and keeps
+the previous one as `credentials.env.prev`.
+
+### On the server, from your machine
 
 ```bash
-~/dmarc-monitor/dmarc-monitor -check
-~/dmarc-monitor/dmarc-monitor -once -dry-run -include-seen
-~/dmarc-monitor/dmarc-monitor -once -include-seen
+make prod-status            # what is installed and scheduled, and the last runs
+make prod-logs N=200        # the tail of cron.log
+make prod-check             # mailbox and relay reachable? sends nothing
+make prod-dry-run           # one cycle, the alert printed; sends and changes nothing
+make prod-test-alert        # ONE REAL test message, and its Message-ID
+make prod-rollback          # the previous binary back (again to roll forward)
+make deploy                 # deploy from here; the ordinary path is a merge
 ```
+
+`-test-alert` is worth running once after the first deploy: a relay that
+authenticates is not the same as a mailbox that receives, and a filtered alert
+looks exactly like a quiet month.
 
 ### One directory holds the installation
 
 ```
 ~/dmarc-monitor/
-  credentials.env   the mailbox and relay passwords   (you write this)
-  dmarc-monitor     the binary                        (downloads itself)
-  state.json        what it remembers between runs
-  run.lock          held while a run is going
-  cron.log          what the last runs did
+  dmarc-monitor        the binary                         (deploy)
+  dmarc-monitor.prev   the one before it                  (deploy)
+  credentials.env      the mailbox and relay passwords    (make deploy-send-secrets)
+  state.json           what it remembers between runs
+  backups/             state.json, one per deploy
+  deployed-commit.txt  the commit and version live
+  run.lock             held while a run is going
+  cron.log             what the last runs did
 ```
 
-So an install can be listed, copied, backed up or deleted in one go, and none
-of it is anywhere else. The credentials and state files are found beside the
-binary; a file left at the older `~/.local/share` or `~/.local/state` location
-is still honoured, so an installation predating this keeps working — nothing is
-moved automatically, because relocating somebody's credentials unasked is not a
-thing a monitoring program should do.
+The credentials and state files are found beside the binary; a file left at the
+older `~/.local/share` or `~/.local/state` location is still honoured, so an
+installation predating this keeps working.
 
 ### The schedule
 
 08:00 and 20:00 US Central, on a server in any timezone. Reports arrive once a
 day, so this sees one within twelve hours; a run takes about a second.
 
-### Why it wakes hourly and throws most of it away
-
 **Debian and Ubuntu cron cannot schedule in another timezone.** `crontab(5)`
-says so under LIMITATIONS: it "does not support per-user timezones... even if a
-user specifies the `TZ` environment variable in his crontab this will affect
-only the commands executed in the crontab, not the execution of the crontab
-tasks themselves". A `CRON_TZ=America/Chicago` line *looks* like it works, is
-silently ignored for scheduling, and leaves a German server firing seven hours
-out. The hourly guard is the workaround that same man page recommends.
+says so under LIMITATIONS: a `TZ` or `CRON_TZ` line affects the commands, not
+when they run. It looks like it works, is silently ignored, and leaves a German
+server firing seven hours out. So cron wakes hourly and the line asks Chicago
+what time it is, throwing away the 22 wakeups that are not 08 or 20 there —
+the workaround that same man page recommends. Asking Chicago, rather than
+computing an offset from Berlin, is also what survives daylight saving: the two
+zones switch on different dates, so for 28 days a year the gap is six hours
+instead of seven.
 
-Asking Chicago what time it is, rather than computing an offset from Berlin, is
-also what survives daylight saving. The two zones switch on different dates, so
-for **28 days a year the gap is six hours instead of seven** — a crontab with
-German clock times hardcoded is an hour wrong every March and October. The guard
-fires exactly twice a day through all four transitions, with no skipped or
-duplicated runs.
+`dmarc-monitor -check` prints what the schedule means in local time, and fails
+loudly if the machine cannot resolve `America/Chicago` — without tzdata, the
+shell's `date` answers in UTC without complaining. `make deploy-status` checks
+the same on the server.
 
-`dmarc-monitor -check` prints what the schedule means in local time:
+The line's other traps — the escaped `\%`, and the trailing `|| echo` that makes
+`MAILTO` mail on a failure and only on a failure — are explained beside
+`cron_line` in `deploy/deploy.sh`, and held by `scripts/deploy-test.sh`, which
+runs the line under `sh` with `date` stubbed.
 
-```
-Local time here is 12:32 CEST; in America/Chicago it is 05:32 CDT.
-deploy/crontab.example runs at 08:00 and 20:00 America/Chicago,
-which is 15:00 CEST and 03:00 CEST here today.
-```
+`-cron` takes a lock, so a long run is never joined by the next one, runs one
+cycle, and exits. `-watch` still exists if you would rather run it resident,
+polling on `POLL_INTERVAL`.
 
-It also fails loudly if the machine cannot resolve `America/Chicago` — without
-tzdata, the shell's `date` answers in UTC without complaining, which would move
-every run by two hours in winter and three in summer.
+## Maintenance
 
-`-cron` is three things in order: take a lock, so a long run is never joined by
-the next one; check for a newer release and install it; run one cycle and exit.
-
-**The one thing that cannot be bootstrapped is the credentials file** — it holds
-the mailbox password. The first scheduled run writes the annotated template to
-`~/.local/share/dmarc-monitor/credentials.env` and exits non-zero, so `MAILTO`
-tells you it is waiting. Fill it in, and the next run works. That is the only
-time anyone needs to log in to the server.
-
-Four details in that line are load-bearing, and each is a real failure:
-
-- **The backslash in `date +\%H` is required**, and there is no other `%` in the
-  line. cron turns an unescaped percent sign into a newline, which would truncate
-  the command mid-guard; that is also why the directory is a separate variable
-  rather than `"${B%/*}"`.
-- **`mkdir` before the redirect.** A redirect into a directory that does not
-  exist fails the entry before anything runs.
-- **`HOME` is left alone.** Both the credentials and the state file are found
-  relative to it; a crontab that overrides `HOME` sends the program looking for
-  its password somewhere it is not.
-- **The trailing `|| echo` is what makes `MAILTO` work.** cron mails whatever a
-  job writes, so a job that redirects everything into a log mails nothing —
-  including on the day it fails. Detail goes to the log, one line goes to mail,
-  and only on failure.
-
-On arm64, change the asset name to `dmarc-monitor-linux-arm64`.
-
-`-watch` still exists if you would rather run it resident, polling on
-`POLL_INTERVAL`.
-
-## Releasing
-
-Servers install published releases and nothing else — never a branch, never a
-commit on main — so shipping is a deliberate act:
-
-```bash
-make release V=v0.1.0     # tags, pushes, and the workflow does the rest
-gh run watch
-```
-
-`.github/workflows/release.yml` re-runs the full gate, builds linux/amd64,
-linux/arm64 and darwin/arm64 with the version stamped in, generates
-`checksums.txt` from the very files it uploads, and publishes them.
-
-Each server mails you when it takes one — subject `[dmarc] updated to v0.2.0 on
-<host>`, naming the versions, the binary it replaced and the release page. That
-is how an unattended deployment is verified: the mail arriving *is* the proof
-the pipeline reached the machine, without logging in to check. It is sent only
-when a build actually lands, before the cycle that follows, so it arrives even
-if that cycle then fails. `ALERT_ON_UPDATE=false` turns it off once it stops
-being interesting.
-
-Each server picks the release up at its next scheduled run. `foundation/selfupdate`
-verifies the download against `checksums.txt` before replacing anything, and a
-mismatch aborts without touching the working binary — the monitor carries on
-with the build it has, which still sends alerts. Prereleases and drafts are
-ignored.
-
-The new binary is put in place with a rename, so the running process keeps its
-own inode and finishes the cycle it is in. The update takes effect at the next
-run; nothing is ever swapped out mid-cycle.
-
-That auto-update is also the sharpest edge in this repository: anything
-published under a `v*` tag runs on the server as the user holding the mailbox
-password. The checksums make the *transport* trustworthy, not the *contents* —
-what protects the contents is that cutting a tag is manual and CI has to pass
-first.
+- **Dependabot** opens one grouped pull request a week for Go modules and one
+  for GitHub Actions (pinned by commit). `.github/workflows/dependabot-merge.yml`
+  merges each once it is a day old with CI green, and dispatches the deploy;
+  a failed deploy fails that run, which is emailed.
+- **CI** runs weekly on main as well as on every change, because govulncheck's
+  answer moves without a commit.
+- **Agents** open pull requests and never touch production; see `AGENTS.md`.
+  `.claude/settings.json` denies the `deploy*`/`prod-*` targets, the scripts
+  behind them, ssh, and reading `secrets.env`.
 
 ## How a cycle works
 
@@ -325,10 +275,10 @@ foundation/dmarcxml       RFC 7489 wire format, zip/gzip unwrapping
 foundation/config         the credentials file
 foundation/checkpoint     what carries over between runs
 foundation/apppath        where an installation's files live
-foundation/selfupdate     installing published releases, checksum-verified
 foundation/lockfile       one run at a time
 foundation/logger         slog setup
-deploy/crontab.example    the entire deployment
+deploy/deploy.sh          the deployment: ship, rollback, and prod-* for a person
+scripts/secrets           secrets.env to GitHub, the server, and this machine
 ```
 
 Business domains never import each other; `app/monitor` composes them, and
@@ -355,7 +305,10 @@ baked into the artefact.
 ## Development
 
 ```bash
-make test           # unit tests + lint + govulncheck
+make test           # unit + shell tests + lint + govulncheck
 make test-unit      # offline
+make shell-test     # secrets rendering and the crontab rewrite, on fixtures
 make lint           # go vet + gofmt check
+make shellcheck     # the shell scripts (CI has shellcheck)
+make release-build  # the static binary the server runs
 ```
