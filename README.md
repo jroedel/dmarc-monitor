@@ -240,6 +240,12 @@ polling on `POLL_INTERVAL`.
   for GitHub Actions (pinned by commit). `.github/workflows/dependabot-merge.yml`
   merges each once it is a day old with CI green, and dispatches the deploy;
   a failed deploy fails that run, which is emailed.
+- **Go itself** is the one pin Dependabot does not move: the `go` line in
+  `go.mod`, which CI and the release build use as the toolchain.
+  `.github/workflows/go-version.yml` (from stewards) checks daily for a newer
+  patch of the same minor release and opens a pull request for it, which merges
+  and deploys like Dependabot's. A new minor (1.26 to 1.27) is left to a
+  person; when the named minor leaves support, it opens an issue instead.
 - **CI** runs weekly on main as well as on every change, because govulncheck's
   answer moves without a commit.
 - **Agents** open pull requests and never touch production; see `AGENTS.md`.

@@ -9,7 +9,9 @@
 #
 # Go modules the same way. govulncheck in CI already fails on a reachable
 # vulnerability; this is what turns that red build into a green pull request
-# with the fix in it.
+# with the fix in it -- for a module. A fix in the standard library is a new
+# go line in go.mod, which Dependabot never moves; .github/workflows/go-version.yml
+# proposes those.
 #
 # One pull request per ecosystem per week, not one per module: merging the
 # first of three puts the other two into conflict on the same lines of go.mod.
