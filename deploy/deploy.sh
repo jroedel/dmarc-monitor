@@ -30,6 +30,10 @@ SECRETS_ENV="${SECRETS_ENV:-$REPO_DIR/secrets.env}"
 APP=dmarc-monitor
 CRON_MARKER="# $APP"
 
+# How many seconds a deploy waits for a cycle to let go of run.lock; see
+# swap_script. Overridable only so scripts/deploy-test.sh need not wait.
+LOCK_WAIT="${LOCK_WAIT:-300}"
+
 log()  { printf '\033[1m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m !!\033[0m %s\n' "$*" >&2; }
 ok()   { printf '\033[32m  ok\033[0m %s\n' "$*"; }
@@ -179,8 +183,8 @@ superseded() {
 #   only way: the crontab is shared with stewards and mass-intentions, and each
 #   project removes only its own marked lines before writing them back.
 #
-# The binary takes a lock, so a run that overruns is never joined by the next,
-# and a hand-run copy cannot collide with a scheduled one.
+# The binary takes run.lock, so a run that overruns is never joined by the
+# next, and a deploy waits for a cycle in progress (swap_script).
 cron_line() {
 	printf '%s\n' "0 * * * * H=\"\$(TZ=America/Chicago date +\\%H)\"; [ \"\$H\" = 08 ] || [ \"\$H\" = 20 ] || exit 0; cd $Q_DIR && ./$APP -cron >> cron.log 2>&1 || echo \"$APP failed; see $APP_DIR/cron.log\" $CRON_MARKER"
 }
@@ -210,22 +214,52 @@ install_cron() {
 
 # ------------------------------------------------------------------ deploy
 
-# backup_state copies state.json aside before a swap. It is what stops a run
-# re-alerting on every report it has already seen, and the one file on the
-# server that is neither in git nor in secrets.env. A new build that misread it
-# would rewrite it at the end of its first cycle; a copy from before is what
-# makes that recoverable. Named by timestamp, newest kept, oldest pruned.
-backup_state() {
-	local stamp; stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+# swap_script prints what runs on the server, in APP_DIR, once the new build
+# has passed its pre-flight: wait for any cycle in progress, back up
+# state.json, swap the binary, and record what was deployed.
+#
+# The wait is on run.lock, the lock -cron holds for a whole cycle. Holding it
+# here means the backup is the state the new build will first read, not one a
+# cycle in progress is about to replace, and a cycle that starts mid-swap waits
+# for the deploy (the binary waits as long, cronLockWait) instead of being
+# skipped. The lock is on a descriptor of the remote shell, so it ends with the
+# ssh session however that ends.
+#
+# A cycle takes seconds. One still holding the lock after LOCK_WAIT seconds is
+# stuck, and the script exits 75 (EX_TEMPFAIL) having changed nothing rather
+# than swap underneath it.
+#
+# state.json is what stops a run re-alerting on every report it has already
+# seen, and the one file on the server that is neither in git nor in
+# secrets.env. A new build that misread it would rewrite it at the end of its
+# first cycle; the copy from before is what makes that recoverable. Named by
+# timestamp, newest kept, oldest pruned.
+#
+# mv rather than cp over the old binary: overwriting a file that is executing
+# gives ETXTBSY, and a rename is atomic.
+#
+# Printed rather than run, like cron_rewrite, so that scripts/deploy-test.sh
+# can run it against a held lock without a server.
+swap_script() {
+	local commit="$1" version="$2" stamp
+	stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 
-	remote_in_app "if [ -f state.json ]; then
-		mkdir -p backups && chmod 700 backups
-		cp -p state.json backups/state-$stamp.json
-		ls -1 backups/state-*.json 2>/dev/null | sort -r | tail -n +$((KEEP_BACKUPS + 1)) | while read -r old; do rm -f \"\$old\"; done
-		echo 'state.json backed up, keeping $KEEP_BACKUPS'
-	else
-		echo 'no state.json yet, so nothing to back up'
-	fi"
+	cat <<-SCRIPT
+		set -e
+		exec 9>>run.lock
+		flock -w $LOCK_WAIT 9 || exit 75
+		if [ -f state.json ]; then
+			mkdir -p backups && chmod 700 backups
+			cp -p state.json backups/state-$stamp.json
+			ls -1 backups/state-*.json 2>/dev/null | sort -r | tail -n +$((KEEP_BACKUPS + 1)) | while read -r old; do rm -f "\$old"; done
+			echo 'state.json backed up, keeping $KEEP_BACKUPS'
+		else
+			echo 'no state.json yet, so nothing to back up'
+		fi
+		[ ! -f $APP ] || cp -p $APP $APP.prev
+		mv $APP.new $APP
+		printf '%s %s\n' '$commit' '$version' > deployed-commit.txt
+	SCRIPT
 }
 
 cmd_deploy() {
@@ -271,18 +305,18 @@ cmd_deploy() {
 		return 0
 	fi
 
-	log "state"
-	backup_state
+	log "waiting out any cycle in progress, then backing up state and swapping"
+	local status=0
+	remote_in_app "$(swap_script "$commit" "$version")" || status=$?
 
-	# mv rather than cp over the old file: overwriting a binary that is
-	# executing gives ETXTBSY, and a rename is atomic. A cron run already going
-	# keeps its own inode and finishes on the old build; the next one starts on
-	# the new. So there is no lock to take and no window to close.
-	log "swapping"
-	remote_in_app "set -e
-[ ! -f $APP ] || cp -p $APP $APP.prev
-mv $APP.new $APP
-printf '%s %s\n' '$commit' '$version' > deployed-commit.txt"
+	case "$status" in
+	0) ;;
+	75)
+		remote_in_app "rm -f $APP.new" || true
+		die "a cycle has held run.lock for ${LOCK_WAIT}s, which no cycle should. Nothing was changed. From your machine, 'make prod-status' shows the last runs"
+		;;
+	*) die "backing up state or swapping failed (exit $status). From your machine, 'make prod-status' shows what is installed" ;;
+	esac
 
 	# The crontab after the binary, so the line never names a file that is not
 	# there yet.
@@ -384,7 +418,7 @@ usage() {
 	cat <<-USAGE
 		usage: deploy/deploy.sh <command>
 
-		  deploy        build, upload, pre-flight, back up state, swap, install the crontab line
+		  deploy        build, upload, pre-flight, wait for a cycle, back up state, swap, install the crontab line
 		  rollback      put the previous binary back (twice is a roll-forward)
 		  status        what is installed and scheduled, and the last runs
 		  logs [n]      the last n lines of cron.log (80)
@@ -394,6 +428,8 @@ usage() {
 		  reports SINCE [UNTIL]
 		                fetch the raw reports received SINCE..UNTIL into local/reports/; read-only
 		  cron-rewrite  filter a crontab on stdin as a deploy would (for tests)
+		  swap-script COMMIT VERSION
+		                print the script a deploy runs on the server to swap (for tests)
 	USAGE
 }
 
@@ -407,5 +443,6 @@ dry-run)      shift; cmd_dry_run "$@" ;;
 test-alert)   shift; cmd_test_alert "$@" ;;
 reports)      shift; cmd_reports "$@" ;;
 cron-rewrite) shift; Q_DIR="$(printf '%q' "${APP_DIR:?APP_DIR is not set}")"; cron_rewrite ;;
+swap-script)  shift; KEEP_BACKUPS="${KEEP_BACKUPS:-14}"; swap_script "${1:?commit}" "${2:?version}" ;;
 *)            usage; exit 2 ;;
 esac

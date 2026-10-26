@@ -68,6 +68,12 @@ const sourceRepo = "https://github.com/jroedel/dmarc-monitor"
 // by nobody.
 const scheduleZone = "America/Chicago"
 
+// cronLockWait is how long -cron waits for run.lock before giving up on the
+// cycle. deploy/deploy.sh waits as long for a cycle (LOCK_WAIT); a cycle takes
+// seconds and a deploy's hold less, so either side running out of it means
+// something is stuck.
+const cronLockWait = 5 * time.Minute
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "dmarc-monitor: %v\n", err)
@@ -138,11 +144,15 @@ func run() error {
 	}
 
 	if f.cron {
-		lock, err := lockfile.Acquire(filepath.Join(filepath.Dir(statePath), "run.lock"))
-		if errors.Is(err, lockfile.ErrHeld) {
-			log.Info("another run is still going; leaving it to finish")
+		lockPath := filepath.Join(filepath.Dir(statePath), "run.lock")
 
-			return nil
+		// Wait rather than skip: with two cycles a day, a skipped one is twelve
+		// hours unwatched. The lock is held by a deploy for seconds, or by a
+		// cycle run by hand; one still held after cronLockWait is stuck, and
+		// failing says so in cron's mail where exiting quietly would not.
+		lock, err := lockfile.AcquireWait(context.Background(), lockPath, cronLockWait)
+		if errors.Is(err, lockfile.ErrHeld) {
+			return fmt.Errorf("%s has been held for %s, by a deploy or another run; this cycle did not run", lockPath, cronLockWait)
 		}
 		if err != nil {
 			return err

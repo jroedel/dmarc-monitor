@@ -194,7 +194,7 @@ one day past `UNTIL`, and may also bring the report for the day before
   state.json           what it remembers between runs
   backups/             state.json, one per deploy
   deployed-commit.txt  the commit and version live
-  run.lock             held while a run is going
+  run.lock             held while a run is going, or a deploy swaps
   cron.log             what the last runs did
 ```
 
@@ -228,7 +228,10 @@ The line's other traps — the escaped `\%`, and the trailing `|| echo` that mak
 runs the line under `sh` with `date` stubbed.
 
 `-cron` takes a lock, so a long run is never joined by the next one, runs one
-cycle, and exits. `-watch` still exists if you would rather run it resident,
+cycle, and exits. A deploy holds the same lock while it backs up `state.json`
+and swaps the binary, and each side waits up to five minutes for the other:
+a cycle that meets a deploy runs a moment late instead of being skipped, and
+one that cannot get the lock in that time fails, so cron mails you. `-watch` still exists if you would rather run it resident,
 polling on `POLL_INTERVAL`.
 
 ## Maintenance

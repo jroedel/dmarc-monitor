@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 #
-# Tests for the part of deploy/deploy.sh that edits a crontab it shares with
-# other projects, and for the crontab line itself. No server: the rewrite is a
-# filter on stdin, and the line is run here under sh with date and the binary
-# stubbed.
+# Tests for the parts of deploy/deploy.sh that edit a crontab it shares with
+# other projects and swap the binary under the run lock, and for the crontab
+# line itself. No server: the rewrite is a filter on stdin, the line is run
+# here under sh with date and the binary stubbed, and the swap script is run in
+# a scratch directory against a lock held with flock.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -80,6 +81,65 @@ if [ ! -e "$home/dmarc-monitor/cron.log" ]; then pass "at 09 Chicago it does not
 
 home="$(run_line 20 1)"
 if grep -q 'dmarc-monitor failed' "$home/stdout"; then pass "a failed run prints one line, so cron mails it"; else fail "a failed run was silent"; fi
+
+echo "the swap, run"
+# The script a deploy runs on the server, run here under sh in an app
+# directory with a state file, the live binary and the uploaded one, against
+# run.lock free, held for a moment by a cycle, and held by a stuck one.
+command -v flock >/dev/null || { echo "  flock (util-linux) is needed for these"; exit 1; }
+
+swap() { LOCK_WAIT="$1" KEEP_BACKUPS=14 "$DEPLOY" swap-script abc123 v9.9.9; }
+
+app_dir() {
+	local dir="$TMP/app-$1"
+	mkdir -p "$dir"
+	echo '{"seen":1}' > "$dir/state.json"
+	echo old > "$dir/dmarc-monitor"
+	echo new > "$dir/dmarc-monitor.new"
+	printf '%s' "$dir"
+}
+
+dir="$(app_dir free)"
+if ( cd "$dir" && swap 1 | sh ) > "$dir/out" 2>&1; then pass "with the lock free it swaps"; else fail "with the lock free it failed: $(cat "$dir/out")"; fi
+if [ "$(cat "$dir/dmarc-monitor")" = new ] && [ "$(cat "$dir/dmarc-monitor.prev")" = old ] && [ ! -e "$dir/dmarc-monitor.new" ]; then
+	pass "the new build is live and the old one kept as .prev"
+else
+	fail "the binaries are not where a swap leaves them: $(ls "$dir")"
+fi
+if cmp -s "$dir/state.json" "$dir"/backups/state-*.json; then pass "state.json is backed up"; else fail "no backup of state.json: $(ls "$dir")"; fi
+if grep -qx 'abc123 v9.9.9' "$dir/deployed-commit.txt"; then pass "deployed-commit.txt names the build"; else fail "deployed-commit.txt: $(cat "$dir/deployed-commit.txt")"; fi
+
+# A cycle in progress: the lock is let go a second in, and the deploy waits
+# for it rather than swapping underneath. The cycle notes which build is in
+# place as it finishes, which must still be the old one.
+dir="$(app_dir busy)"
+# shellcheck disable=SC2016 # $1 is the inner shell's, not this one's
+flock "$dir/run.lock" sh -c 'sleep 1; cat "$1/dmarc-monitor" > "$1/seen-by-cycle"' sh "$dir" &
+holder=$!
+sleep 0.2
+if ( cd "$dir" && swap 10 | sh ) > "$dir/out" 2>&1 && [ "$(cat "$dir/dmarc-monitor")" = new ]; then
+	pass "it swaps once a cycle in progress is done"
+else
+	fail "it did not swap after the cycle finished: $(cat "$dir/out")"
+fi
+wait "$holder"
+if [ "$(cat "$dir/seen-by-cycle")" = old ]; then pass "and not underneath it"; else fail "it swapped while the cycle held the lock"; fi
+
+# A stuck cycle: it exits 75, and nothing has changed.
+dir="$(app_dir stuck)"
+flock "$dir/run.lock" sleep 5 &
+holder=$!
+sleep 0.2
+status=0
+( cd "$dir" && swap 1 | sh ) > "$dir/out" 2>&1 || status=$?
+if [ "$status" = 75 ]; then pass "a stuck cycle makes it exit 75"; else fail "a stuck cycle made it exit $status: $(cat "$dir/out")"; fi
+if [ "$(cat "$dir/dmarc-monitor")" = old ] && [ -e "$dir/dmarc-monitor.new" ] && [ ! -e "$dir/backups" ] && [ ! -e "$dir/deployed-commit.txt" ]; then
+	pass "and changes nothing"
+else
+	fail "a stuck cycle still changed things: $(ls "$dir")"
+fi
+kill "$holder" 2>/dev/null || true
+wait "$holder" 2>/dev/null || true
 
 echo
 [ "$FAILED" -eq 0 ] || { echo "$FAILED failure(s)"; exit 1; }
