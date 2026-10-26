@@ -17,9 +17,9 @@ on:
   schedule:
     - cron: "17 6 * * 1"
 
-  # For go-patch.yml: a pull request opened with the workflow token triggers
-  # nothing, so that workflow dispatches this on its branch, and these checks
-  # are the ones the Dependabot merge waits for.
+  # For go-version.yml: a pull request opened with the repository's token
+  # starts no workflow, so that workflow starts this one on its branch, and
+  # the checks land on the commit the merge workflow reads.
   workflow_dispatch:
 
 permissions:
