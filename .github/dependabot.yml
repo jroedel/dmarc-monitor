@@ -39,6 +39,13 @@ updates:
     schedule:
       interval: weekly
       day: monday
+    # Indirect requires too, not only direct ones (the default). The tools are
+    # among them: govulncheck is a `tool` line, so golang.org/x/vuln is an
+    # indirect require, and by default it stayed at v1.6.0 while v1.9.0 was
+    # out (2026-10-26). The scanner that gates every merge should not be the
+    # one pin nothing moves.
+    allow:
+      - dependency-type: all
     groups:
       go-modules:
         patterns: ["*"]
