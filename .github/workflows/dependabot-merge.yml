@@ -1,6 +1,10 @@
 # Merge Dependabot's pull requests once they have sat for a day with CI green,
 # then deploy, then say so if the deploy failed. Taken from eumaeus.
 #
+# Also go-patch.yml's: the Go patch bumps Dependabot cannot make, opened by
+# github-actions on a bump/go-* branch. Those two, and nothing else; a pull
+# request from a person is never merged here.
+#
 # Dependency bumps are not a person's job. CI already decides whether a bump
 # builds, tests, vets and scans clean, and the deploy pre-flights the new build
 # against the live mailbox before it swaps anything. What was left for a
@@ -71,13 +75,16 @@ jobs:
           merged=0
           cutoff=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
 
-          gh pr list --author app/dependabot --state open \
-            --json number,title,createdAt,mergeable,headRefOid \
-            -q '.[] | "\(.number)\t\(.createdAt)\t\(.mergeable)\t\(.headRefOid)\t\(.title)"' \
+          gh pr list --state open \
+            --json number,title,createdAt,mergeable,headRefOid,headRefName,author \
+            -q '.[]
+                | select(.author.login == "app/dependabot"
+                         or (.author.login == "app/github-actions" and (.headRefName | startswith("bump/go-"))))
+                | "\(.number)\t\(.createdAt)\t\(.mergeable)\t\(.headRefOid)\t\(.title)"' \
             > prs.tsv
 
           if [ ! -s prs.tsv ]; then
-            echo "no open Dependabot pull requests"
+            echo "no open Dependabot or Go patch pull requests"
             echo "merged=0" >> "$GITHUB_OUTPUT"
             exit 0
           fi
